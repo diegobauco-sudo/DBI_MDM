@@ -167,13 +167,13 @@ El script crea una **clave de despliegue de solo lectura** y la muestra: agregal
 
 ### Publicar una versión nueva
 
-Con los cambios guardados en el repositorio:
+Las versiones se publican solas: cuando llega código nuevo a la rama `main`, GitHub (pestaña **Actions**) corre todas las pruebas y, si pasan, crea la etiqueta `vX.Y.Z` con el número de `server/package.json`. Si las pruebas fallan, no publica nada. Para publicar una versión nueva, con los cambios guardados:
 
 ```bash
-tools/publicar-version.sh 2.2.0
+tools/publicar-version.sh 2.3.0
 ```
 
-Pone la versión en `server/package.json`, corre las pruebas, crea la etiqueta `v2.2.0` y la sube. Los servidores la ven al tocar **Buscar actualizaciones**. Si las pruebas fallan, no publica nada.
+Cambia el número de versión, corre las pruebas y sube la rama. En unos minutos la versión aparece en **Buscar actualizaciones**. Si solo subís cambios sin cambiar el número de versión, no se publica nada nuevo.
 
 ### Lo que no se actualiza por acá
 
