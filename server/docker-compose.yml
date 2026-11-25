@@ -1,0 +1,27 @@
+services:
+  wifly:
+    build: .
+    restart: unless-stopped
+    environment:
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      PUBLIC_URL: https://${DOMAIN}
+      TRUST_PROXY: "1"
+    volumes:
+      - wifly-data:/data
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - wifly
+volumes:
+  wifly-data:
+  caddy-data:

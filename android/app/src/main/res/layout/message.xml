@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent">
+    <LinearLayout android:id="@+id/card" android:layout_width="620dp" android:layout_height="wrap_content" android:layout_gravity="center"
+        android:orientation="vertical" android:background="#FF101A2A" android:padding="32dp">
+        <TextView android:id="@+id/msg_title" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:textColor="#FF39D0C4" android:textSize="24sp" android:textStyle="bold" />
+        <TextView android:id="@+id/msg_body" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:textColor="#FFFFFFFF" android:textSize="18sp" android:layout_marginTop="12dp" />
+        <Button android:id="@+id/msg_ok" style="@style/Btn" android:layout_marginTop="24dp" android:gravity="center" android:text="Aceptar" />
+    </LinearLayout>
+</FrameLayout>

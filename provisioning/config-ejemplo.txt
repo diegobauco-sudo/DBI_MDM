@@ -1,0 +1,16 @@
+# Configuración del enrolamiento. Copiá este archivo como config.txt y completalo.
+# Solo letras, números, guion y guion bajo en TOKEN, USUARIO y CLAVE.
+# Guardá esta carpeta en una PC de confianza: contiene la clave de salida del kiosko.
+
+# Dirección del panel
+SERVIDOR=https://hmdm.wifly.net.ar
+
+# Token de "Alta de equipos" en el panel
+TOKEN=
+
+# Usuario y clave para salir del kiosko (los mismos del perfil del panel)
+USUARIO=
+CLAVE=
+
+# Cerrar ADB al terminar: si, no o preguntar
+CERRAR_ADB=preguntar

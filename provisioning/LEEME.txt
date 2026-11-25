@@ -1,0 +1,28 @@
+WiFly - Enrolador de TV Box para Windows
+=========================================
+
+PREPARAR (una sola vez)
+1. Copiá todos estos archivos dentro de C:\platform-tools (donde está adb.exe).
+2. Copiá config-ejemplo.txt como config.txt y completá TOKEN, USUARIO y CLAVE.
+   - El TOKEN se crea en el panel, sección "Alta de equipos".
+   - USUARIO y CLAVE son los de salida del kiosko, los mismos del perfil del panel.
+   - Solo letras, números, guion y guion bajo. La clave, 8 caracteres o más.
+
+EN CADA TV BOX
+- Restablecido de fábrica, sin cuentas, con internet y con Depuración USB activada.
+- ADB por red encendido, o conectado por cable USB de datos.
+
+USAR
+1. Doble clic en enrolar.bat.
+2. Escribí la IP del TV Box (o Enter si está conectado por cable).
+3. Al final pregunta si cerrar ADB. Probá Home con el control antes de responder.
+
+Para varios equipos seguidos: copiá lista-ip-ejemplo.txt como lista-ip.txt,
+poné una IP por línea y elegí la opción L.
+
+Cada intento queda anotado en registro.csv (se abre con Excel).
+
+El script detecta solo si el modelo admite la protección completa o si va en
+modo compatible (como el Q5).
+
+Guardá esta carpeta en una PC de confianza: config.txt tiene la clave de salida.

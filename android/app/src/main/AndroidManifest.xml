@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.wifly.launcher"
+    android:versionCode="4"
+    android:versionName="1.2.1">
+
+    <!-- targetSdk 28 a propósito: mantiene WifiManager.addNetwork/setWifiEnabled y la
+         visibilidad de paquetes, que son lo que permite una pantalla WiFi propia sin Ajustes. -->
+    <uses-sdk android:minSdkVersion="23" android:targetSdkVersion="28" />
+
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.wifi" android:required="false" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Solo se concede por ADB (pm grant). Permite al modo compatible reencender la guardia y cerrar ADB. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+
+    <application
+        android:name=".App"
+        android:label="@string/app_name"
+        android:icon="@drawable/icon"
+        android:banner="@drawable/banner"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/WiFly">
+
+        <!-- El launcher. lockTaskMode=if_whitelisted lo mete en Lock Task apenas está en la lista. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:clearTaskOnLaunch="true"
+            android:stateNotNeeded="true"
+            android:excludeFromRecents="true"
+            android:lockTaskMode="if_whitelisted"
+            android:screenOrientation="landscape"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|uiMode|locale|layoutDirection">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- Entrada visible en el launcher original solo cuando el kiosko está desactivado.
+             Siempre pide usuario y clave. -->
+        <activity
+            android:name=".AdminLoginActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:excludeFromRecents="true"
+            android:theme="@style/WiFly.Panel">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity android:name=".AdminActivity" android:exported="false" android:excludeFromRecents="true" android:theme="@style/WiFly.Panel" />
+        <activity android:name=".AppPickerActivity" android:exported="false" android:excludeFromRecents="true" android:theme="@style/WiFly.Panel" />
+        <activity android:name=".EnrollActivity" android:exported="false" android:excludeFromRecents="true" android:theme="@style/WiFly.Panel" />
+        <activity android:name=".WifiActivity" android:exported="false" android:excludeFromRecents="true" android:theme="@style/WiFly.Panel" />
+
+        <!-- Afinidad propia: si compartiera la del launcher, cada mensaje traería el launcher
+             al frente y sacaría al usuario de la película. -->
+        <activity
+            android:name=".MessageActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:taskAffinity="com.wifly.launcher.message"
+            android:excludeFromRecents="true"
+            android:theme="@style/WiFly.Message" />
+
+        <service android:name=".MdmService" android:exported="false" />
+
+        <service
+            android:name=".KeyGuardService"
+            android:exported="true"
+            android:label="@string/a11y_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice" android:resource="@xml/a11y" />
+        </service>
+
+        <receiver
+            android:name=".AdminReceiver"
+            android:exported="true"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data android:name="android.app.device_admin" android:resource="@xml/device_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                <action android:name="android.app.action.PROFILE_PROVISIONING_COMPLETE" />
+            </intent-filter>
+        </receiver>
+
+        <receiver android:name=".BootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Protegido con DUMP: solo adb shell (o el sistema) puede enviarlo.
+             Otra app instalada en el equipo no puede reconfigurar el kiosko. -->
+        <receiver
+            android:name=".ProvisionReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+
+        <receiver android:name=".InstallReceiver" android:exported="false" />
+    </application>
+</manifest>

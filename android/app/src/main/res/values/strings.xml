@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">WiFly Launcher</string>
+    <string name="a11y_label">WiFly protección de teclas</string>
+    <string name="a11y_desc">Hace que la tecla Home vuelva siempre a WiFly y bloquea las teclas que abren otras pantallas.</string>
+    <string name="wifi">WiFi</string>
+    <string name="blocked_title">Equipo bloqueado</string>
+    <string name="blocked_body">Este equipo fue bloqueado por el administrador.</string>
+    <string name="no_apps">Todavía no hay aplicaciones asignadas</string>
+    <string name="warn_owner">WiFly no es Device Owner: el kiosko no está protegido. Volvé a instalarlo con el script.</string>
+    <string name="warn_default">Clave de administrador por defecto. Cambiala antes de entregar este equipo.</string>
+</resources>

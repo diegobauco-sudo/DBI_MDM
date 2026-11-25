@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent" android:fillViewport="true">
+    <LinearLayout android:id="@+id/panel" android:layout_width="560dp" android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal" android:orientation="vertical" android:paddingTop="27dp" android:paddingBottom="27dp">
+        <TextView android:id="@+id/heading" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:textColor="#FFFFFFFF" android:textSize="24sp" android:textStyle="bold" />
+        <TextView android:id="@+id/subheading" android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:textColor="#CCFFFFFF" android:textSize="14sp" android:layout_marginTop="4dp" android:layout_marginBottom="8dp" />
+    </LinearLayout>
+</ScrollView>

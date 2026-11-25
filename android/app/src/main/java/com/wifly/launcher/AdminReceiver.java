@@ -1,0 +1,18 @@
+package com.wifly.launcher;
+
+import android.app.admin.DeviceAdminReceiver;
+import android.content.Context;
+import android.content.Intent;
+
+public class AdminReceiver extends DeviceAdminReceiver {
+    @Override public void onEnabled(Context c, Intent i) {
+        Policy.apply(c);
+        Compat.startService(c);
+    }
+
+    @Override public void onProfileProvisioningComplete(Context c, Intent i) {
+        Policy.apply(c);
+        Compat.startService(c);
+        Policy.goHome(c);
+    }
+}
