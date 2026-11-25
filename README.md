@@ -137,6 +137,23 @@ Desde la versión 2.1.0, el administrador general actualiza el servidor desde el
 
 El panel y los TV Box se desconectan entre 1 y 3 minutos; los TV Box siguen funcionando con su última configuración.
 
+### Subir el proyecto a GitHub (una sola vez)
+
+1. En GitHub, creá un repositorio **nuevo y privado**, por ejemplo `wifly-mdm`, **vacío**: sin README, sin .gitignore y sin licencia.
+2. En tu PC con Ubuntu, descomprimí el zip del proyecto (trae el historial de versiones) y subilo:
+
+   ```bash
+   sudo apt install -y git gh
+   gh auth login                     # elegí GitHub.com, HTTPS, y entrá con el navegador
+   cd wifly
+   git remote add origin https://github.com/USUARIO/wifly-mdm.git
+   git push -u origin main --tags
+   ```
+
+   En GitHub tienen que aparecer las versiones `v1.2.1`, `v2.0.0` y `v2.1.0` en **Tags**.
+
+La clave de firma (`android/wifly-release.jks`), su contraseña y el `.env` no se suben: están excluidos. Guardalos aparte.
+
 ### Activarlo (una sola vez por servidor)
 
 Requiere el servidor en 2.1.0 o más, instalado como indica "Actualizar un servidor 1.x". Dentro del CT:
