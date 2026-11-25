@@ -43,6 +43,10 @@ test('el panel exige sesión y rechaza claves incorrectas', async () => {
   assert.equal((await admin('GET', '/api/devices')).status, 401);
   assert.equal((await admin('POST', '/api/login', { username: 'admin', password: 'mal' })).status, 401);
   assert.equal((await admin('POST', '/api/login', { username: 'admin', password: 'clave-de-prueba-1' })).status, 200);
+  assert.equal((await admin('GET', '/api/devices')).status, 409, 'el administrador general tiene que elegir una empresa');
+  const c = await admin('POST', '/api/companies', { name: 'Hotel Sur' });
+  assert.equal(c.status, 200);
+  await admin('POST', '/api/context', { companyId: c.body.id });
   assert.equal((await admin('GET', '/api/devices')).status, 200);
 });
 

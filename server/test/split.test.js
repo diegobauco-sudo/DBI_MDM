@@ -33,6 +33,8 @@ before(async () => {
   await new Promise((ok) => { srv = ctx.app.listen(0, ok); });
   base = `http://127.0.0.1:${srv.address().port}`;
   await admin('POST', '/api/login', { username: 'admin', password: 'clave-de-prueba-1' });
+  const c = await admin('POST', '/api/companies', { name: 'Split SA' });
+  await admin('POST', '/api/context', { companyId: c.body.id });
   const token = (await admin('POST', '/api/enroll-tokens', {})).body.token;
   const e = await fetch(`${base}/api/device/enroll`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token, installId: 'splitdevice1' }) });
   ({ deviceToken, deviceId } = await e.json());

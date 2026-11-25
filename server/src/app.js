@@ -6,50 +6,79 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inspectUpload, readApkManifest, BundleError } from './bundle.js';
 import { openDb } from './db.js';
+import { createBilling } from './billing.js';
 import { randomToken, sha256, hashAdminPassword, verifyAdminPassword, hashExitPassword, rateLimiter } from './security.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ONLINE_MS = 70_000;
 const SESSION_MS = 12 * 3600_000;
 const MESSAGE_TTL_MS = 7 * 24 * 3600_000;
+const DAY_MS = 86400_000;
+const PRODUCT = 'WiFly MDM';
+const SUSPENDED_TITLE = 'Servicio suspendido';
+const SUSPENDED_MESSAGE = 'Comuníquese con su proveedor.';
 const IMAGE_MAGIC = [
   { mime: 'image/jpeg', test: (b) => b[0] === 0xff && b[1] === 0xd8 },
   { mime: 'image/png', test: (b) => b.subarray(0, 4).toString('hex') === '89504e47' },
   { mime: 'image/webp', test: (b) => b.subarray(0, 4).toString() === 'RIFF' && b.subarray(8, 12).toString() === 'WEBP' },
 ];
 const BULK_COMMANDS = new Set(['message', 'reboot', 'sync', 'install', 'uninstall', 'exitKiosk', 'enterKiosk', 'decommission']);
+/** Lo único que puede hacer un operador sobre los equipos. */
+const OPERATOR_ACTIONS = new Set(['message', 'lock', 'unlock']);
+const ROLE_LABEL = { superadmin: 'administrador general', admin: 'administrador', operator: 'operador' };
 
 const ACTION_LABEL = { message: 'mensaje', lock: 'bloqueo', unlock: 'desbloqueo', assignProfile: 'cambio de perfil', reboot: 'reinicio', sync: 'sincronización', install: 'instalar app', uninstall: 'desinstalar app', exitKiosk: 'salir del kiosko', enterKiosk: 'activar kiosko', decommission: 'baja' };
 
+/** El título vacío muestra el nombre de la empresa en el TV Box. */
 const DEFAULT_PROFILE = {
-  title: 'WiFly', showClock: true, allowWifi: true, adbAllowed: false,
+  title: '', showClock: true, allowWifi: true, adbAllowed: false,
   wallpaperSha: '', launcherApkSha: '', apps: [], removePackages: [], helpers: [], exit: null,
 };
 
+const DEFAULT_SETTINGS = { brandPhrase: '', graceDays: '7', timezone: 'America/Argentina/Buenos_Aires' };
+
 class HttpError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  constructor(status, message, code) { super(message); this.status = status; this.code = code; }
 }
 
-export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureCookies = false, trustProxy = false, longPollMs = 25_000, maxUploadMb = 1024 }) {
+const USERNAME_RE = /^[A-Za-z0-9._@-]{3,40}$/;
+
+export function createApp({
+  dataDir, adminUser = 'admin', adminPassword, secureCookies = false, trustProxy = false,
+  longPollMs = 25_000, maxUploadMb = 1024, clock = Date.now, billingIntervalMs = 10 * 60_000,
+}) {
   const db = openDb(dataDir);
   const filesDir = path.join(dataDir, 'files');
   const tmpDir = path.join(dataDir, 'tmp');
   fs.mkdirSync(tmpDir, { recursive: true });
   const q = (sql) => db.prepare(sql);
-  const now = () => Date.now();
+  const now = () => clock();
+
+  // ---- Configuración general --------------------------------------------------------------
+  const getSetting = (key) => q('SELECT value FROM settings WHERE key=?').get(key)?.value ?? DEFAULT_SETTINGS[key];
+  const setSetting = (key, value) => q('INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT (key) DO UPDATE SET value=excluded.value').run(key, String(value));
+  const graceMs = () => Number(getSetting('graceDays')) * DAY_MS;
+  const billing = createBilling(db, { now, timezone: () => getSetting('timezone') });
 
   // ---- Datos iniciales ------------------------------------------------------------------
   let generatedPassword = null;
-  if (!q('SELECT 1 FROM admins LIMIT 1').get()) {
+  if (!q(`SELECT 1 FROM users WHERE role='superadmin' LIMIT 1`).get()) {
     const pass = adminPassword || (generatedPassword = randomToken(12));
     const { salt, hash } = hashAdminPassword(pass);
-    q('INSERT INTO admins (username, salt, hash) VALUES (?,?,?)').run(adminUser, salt, hash);
-  }
-  if (!q('SELECT 1 FROM profiles LIMIT 1').get()) {
-    q('INSERT INTO profiles (name, json, updated_at) VALUES (?,?,?)').run('General', JSON.stringify(DEFAULT_PROFILE), now());
+    q(`INSERT INTO users (username, salt, hash, role, company_id, created_at) VALUES (?,?,?,'superadmin',NULL,?)`).run(adminUser, salt, hash, now());
   }
 
-  const audit = (actor, action, detail = '') => q('INSERT INTO audit (ts, actor, action, detail) VALUES (?,?,?,?)').run(now(), actor, action, String(detail).slice(0, 500));
+  const audit = (companyId, actor, action, detail = '') => q('INSERT INTO audit (ts, company_id, actor, action, detail) VALUES (?,?,?,?,?)')
+    .run(now(), companyId ?? null, actor, action, String(detail).slice(0, 500));
+
+  // ---- Empresas -------------------------------------------------------------------------
+  const companyById = (id) => (id == null ? null : q('SELECT * FROM companies WHERE id=?').get(id));
+  /** Los TV Box se suspenden cuando pasan los días de gracia desde que se suspendió el panel. */
+  const devicesSuspendAt = (c) => (c && c.status === 'suspended' && c.suspended_at ? c.suspended_at + graceMs() : null);
+  const devicesSuspended = (c) => {
+    const at = devicesSuspendAt(c);
+    return at !== null && now() >= at;
+  };
 
   // ---- Long polling ---------------------------------------------------------------------
   const waiters = new Map();
@@ -57,43 +86,55 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
     const w = waiters.get(deviceId);
     if (w) { waiters.delete(deviceId); w(); }
   };
-  const wakeProfile = (profileId) => {
-    for (const d of q('SELECT id FROM devices WHERE profile_id = ?').all(profileId)) wake(d.id);
-  };
+  const wakeWhere = (sql, ...args) => { for (const d of q(`SELECT id FROM devices WHERE ${sql}`).all(...args)) wake(d.id); };
+  const wakeProfile = (profileId) => wakeWhere('profile_id = ?', profileId);
+  const wakeCompany = (companyId) => wakeWhere('company_id = ?', companyId);
+  const wakeAll = () => { for (const id of [...waiters.keys()]) wake(id); };
 
-  // ---- Configuración efectiva de cada equipo ---------------------------------------------
-  const fileBySha = (sha) => (sha ? q('SELECT * FROM files WHERE sha = ?').get(sha) : null);
+  // ---- Archivos ---------------------------------------------------------------------------
+  const fileOf = (companyId, sha) => (sha && typeof sha === 'string' ? q('SELECT * FROM files WHERE company_id=? AND sha=?').get(companyId, sha) : null);
   /** Para una app dividida incluye sus partes: el equipo elige las de su arquitectura y las instala juntas. */
-  const apkRef = (sha) => {
-    const f = fileBySha(sha);
+  const apkRef = (companyId, sha) => {
+    const f = fileOf(companyId, sha);
     if (!f || f.kind !== 'apk') return null;
     const ref = { sha: f.sha, versionCode: f.version_code, size: f.size };
     if (f.parts) ref.parts = JSON.parse(f.parts);
     return ref;
   };
+  /** El contenido se guarda una vez por SHA-256 aunque lo suban varias empresas; se borra cuando nadie lo usa. */
+  const dropBlobIfUnused = (sha) => {
+    if (!q('SELECT 1 FROM files WHERE sha=? LIMIT 1').get(sha)) fs.rmSync(path.join(filesDir, sha), { force: true });
+  };
 
+  // ---- Configuración efectiva de cada equipo ---------------------------------------------
   function deviceConfig(device) {
-    const row = device.profile_id ? q('SELECT json FROM profiles WHERE id = ?').get(device.profile_id) : null;
+    const company = companyById(device.company_id);
+    const row = device.profile_id ? q('SELECT json FROM profiles WHERE id = ? AND company_id = ?').get(device.profile_id, device.company_id) : null;
     const p = { ...DEFAULT_PROFILE, ...(row ? JSON.parse(row.json) : {}) };
     const over = JSON.parse(device.app_overrides);
     const removed = new Set(over.remove);
     const apps = p.apps.filter((a) => !removed.has(a.package));
     for (const pkg of over.add) if (!apps.some((a) => a.package === pkg)) apps.push({ package: pkg });
-    const wp = fileBySha(p.wallpaperSha);
+    const wp = fileOf(device.company_id, p.wallpaperSha);
+    const suspended = devicesSuspended(company);
+    const cid = device.company_id;
     const cfg = {
-      title: p.title,
+      title: p.title || company?.name || 'WiFly',
+      brandPhrase: getSetting('brandPhrase'),
       showClock: p.showClock,
       allowWifi: p.allowWifi,
       adbAllowed: p.adbAllowed,
-      wallpaper: wp ? { sha: wp.sha } : null,
-      launcherApk: apkRef(p.launcherApkSha),
-      apps: apps.map((a) => ({ package: a.package, label: a.label || '', apk: apkRef(a.apkSha) })),
+      wallpaper: wp && wp.kind === 'image' ? { sha: wp.sha } : null,
+      launcherApk: apkRef(cid, p.launcherApkSha),
+      apps: apps.map((a) => ({ package: a.package, label: a.label || '', apk: apkRef(cid, a.apkSha) })),
       removePackages: p.removePackages,
       helpers: p.helpers,
       exit: p.exit,
-      blocked: !!device.blocked,
-      blockTitle: device.block_title,
-      blockMessage: device.block_message,
+      // La suspensión por falta de pago usa la misma pantalla de bloqueo, con su texto fijo.
+      blocked: suspended || !!device.blocked,
+      blockTitle: suspended ? SUSPENDED_TITLE : device.block_title,
+      blockMessage: suspended ? SUSPENDED_MESSAGE : device.block_message,
+      suspended,
     };
     return { ...cfg, version: sha256(JSON.stringify(cfg)).slice(0, 24) };
   }
@@ -126,22 +167,32 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
       enrollLimiter.hit(req.ip);
       throw new HttpError(403, 'Token de enrolamiento inválido o vencido');
     }
+    const company = companyById(t.company_id);
+    if (!company || devicesSuspended(company)) throw new HttpError(403, 'La empresa de este token está suspendida');
     const deviceToken = randomToken();
     const state = JSON.stringify({ model, manufacturer, androidVersion, sdk });
-    const existing = q('SELECT id FROM devices WHERE install_id = ?').get(installId);
-    let id;
-    if (existing) {
-      id = existing.id;
+    const profile = t.profile_id || q('SELECT id FROM profiles WHERE company_id=? ORDER BY id LIMIT 1').get(t.company_id)?.id || null;
+    const existing = q('SELECT id, company_id, name FROM devices WHERE install_id = ?').get(installId);
+    let id, name;
+    if (existing && existing.company_id === t.company_id) {
+      ({ id, name } = existing);
       q('UPDATE devices SET token_hash=?, state=?, last_seen=? WHERE id=?').run(sha256(deviceToken), state, now(), id);
+    } else if (existing) {
+      // El equipo pasa a otra empresa: arranca limpio con el perfil y grupo del token nuevo.
+      ({ id, name } = existing);
+      q(`UPDATE devices SET company_id=?, token_hash=?, state=?, last_seen=?, profile_id=?, grp=?, notes='', blocked=0, block_title='', block_message='',
+           app_overrides='{"add":[],"remove":[]}' WHERE id=?`).run(t.company_id, sha256(deviceToken), state, now(), profile, t.grp, id);
+      q('DELETE FROM commands WHERE device_id=?').run(id);
+      audit(existing.company_id, 'equipo', 'pasó a otra empresa', name);
     } else {
       id = crypto.randomUUID();
-      const profile = t.profile_id || q('SELECT id FROM profiles ORDER BY id LIMIT 1').get()?.id || null;
-      const name = `${String(model).slice(0, 40) || 'TV Box'} ${id.slice(0, 4)}`;
-      q(`INSERT INTO devices (id, token_hash, install_id, name, grp, profile_id, state, last_seen, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?)`).run(id, sha256(deviceToken), installId, name, t.grp, profile, state, now(), now());
+      name = `${String(model).slice(0, 40) || 'TV Box'} ${id.slice(0, 4)}`;
+      q(`INSERT INTO devices (id, company_id, token_hash, install_id, name, grp, profile_id, state, last_seen, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`).run(id, t.company_id, sha256(deviceToken), installId, name, t.grp, profile, state, now(), now());
     }
     q('UPDATE enroll_tokens SET uses = uses + 1 WHERE token = ?').run(token);
-    audit('equipo', 'alta', `${model} ${id.slice(0, 4)}`);
+    billing.recordDevice(t.company_id, id, name);
+    audit(t.company_id, 'equipo', 'alta', `${model} ${id.slice(0, 4)}`);
     res.json({ deviceId: id, deviceToken });
   });
 
@@ -206,13 +257,13 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
     res.json({ ok: true });
   });
 
-  const sendStored = (res, sha) => {
-    const f = /^[0-9a-f]{64}$/.test(sha) ? fileBySha(sha) : null;
+  const sendStored = (res, companyId, sha) => {
+    const f = /^[0-9a-f]{64}$/.test(sha) ? fileOf(companyId, sha) : null;
     if (!f) throw new HttpError(404, 'Archivo inexistente');
     res.set('Content-Type', f.mime);
     res.sendFile(path.join(filesDir, f.sha));
   };
-  app.get('/api/device/files/:sha', deviceAuth, (req, res) => sendStored(res, req.params.sha));
+  app.get('/api/device/files/:sha', deviceAuth, (req, res) => sendStored(res, req.device.company_id, req.params.sha));
 
   // ---- Sesión del panel -------------------------------------------------------------------
   const loginLimiter = rateLimiter({ max: 8, windowMs: 15 * 60_000 });
@@ -226,50 +277,295 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
   };
   const setCookie = (res, value, maxAge) => res.append('Set-Cookie',
     `${COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secureCookies ? '; Secure' : ''}`);
+  const suspendedPanel = () => new HttpError(403, 'La empresa está suspendida. Comuníquese con su proveedor.', 'suspended');
 
   app.post('/api/login', (req, res) => {
     if (loginLimiter.blocked(req.ip)) throw new HttpError(429, 'Demasiados intentos. Esperá 15 minutos.');
     const { username, password } = req.body || {};
-    const a = typeof username === 'string' ? q('SELECT * FROM admins WHERE username = ?').get(username) : null;
-    const ok = a && typeof password === 'string' && verifyAdminPassword(password, a.salt, a.hash);
+    const u = typeof username === 'string' ? q('SELECT * FROM users WHERE username = ?').get(username.trim()) : null;
+    const ok = u && typeof password === 'string' && verifyAdminPassword(password, u.salt, u.hash);
     if (!ok) {
       loginLimiter.hit(req.ip);
       throw new HttpError(401, 'Usuario o clave incorrectos');
     }
     loginLimiter.clear(req.ip);
+    if (u.role !== 'superadmin' && companyById(u.company_id)?.status !== 'active') throw suspendedPanel();
     const token = randomToken();
     q('DELETE FROM sessions WHERE expires_at < ?').run(now());
-    q('INSERT INTO sessions (token_hash, admin_id, expires_at) VALUES (?,?,?)').run(sha256(token), a.id, now() + SESSION_MS);
+    q('INSERT INTO sessions (token_hash, user_id, company_id, expires_at) VALUES (?,?,?,?)').run(sha256(token), u.id, u.company_id, now() + SESSION_MS);
     setCookie(res, token, SESSION_MS / 1000);
-    audit(a.username, 'login');
-    res.json({ username: a.username });
+    audit(u.company_id, u.username, 'ingreso');
+    res.json({ username: u.username, role: u.role });
   });
 
-  const adminAuth = (req, res, next) => {
+  /** Sesión válida + empresa activa. Para el administrador general, la empresa es la que eligió administrar. */
+  const auth = (req, res, next) => {
     const token = readCookie(req);
-    const s = token ? q(`SELECT a.id, a.username, a.salt, a.hash FROM sessions s JOIN admins a ON a.id = s.admin_id
-                         WHERE s.token_hash = ? AND s.expires_at > ?`).get(sha256(token), now()) : null;
+    const s = token ? q(`SELECT u.id, u.username, u.salt, u.hash, u.role, u.company_id AS userCompany, s.company_id AS ctxCompany, s.token_hash
+                         FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?`).get(sha256(token), now()) : null;
     if (!s) return res.status(401).json({ error: 'Sesión vencida' });
     // Un formulario de otro sitio no puede agregar este encabezado.
     if (req.method !== 'GET' && req.get('x-wifly') !== '1') return res.status(403).json({ error: 'Solicitud rechazada' });
-    req.admin = s;
+    if (s.role === 'superadmin') {
+      req.companyId = companyById(s.ctxCompany) ? s.ctxCompany : null;
+    } else {
+      if (companyById(s.userCompany)?.status !== 'active') {
+        q('DELETE FROM sessions WHERE token_hash=?').run(s.token_hash);
+        return res.status(403).json({ error: suspendedPanel().message, code: 'suspended' });
+      }
+      req.companyId = s.userCompany;
+    }
+    req.user = s;
     next();
   };
+  const isSuper = (req) => req.user.role === 'superadmin';
+  /** Rutas de una empresa: el administrador general tiene que haber elegido cuál administrar. */
+  const company = (...roles) => [auth, (req, res, next) => {
+    if (!req.companyId) return res.status(409).json({ error: 'Elegí una empresa para administrar', code: 'no_company' });
+    if (!isSuper(req) && !roles.includes(req.user.role)) return res.status(403).json({ error: 'Tu usuario no tiene permiso para esto' });
+    next();
+  }];
+  const superOnly = [auth, (req, res, next) => (isSuper(req) ? next() : res.status(403).json({ error: 'Solo el administrador general puede hacer esto' }))];
+  const ADMIN = company('admin');
+  const STAFF = company('admin', 'operator');
+  const actor = (req) => req.user.username;
 
-  app.post('/api/logout', adminAuth, (req, res) => {
+  app.post('/api/logout', auth, (req, res) => {
     q('DELETE FROM sessions WHERE token_hash = ?').run(sha256(readCookie(req)));
     setCookie(res, '', 0);
     res.json({ ok: true });
   });
-  app.get('/api/me', adminAuth, (req, res) => res.json({ username: req.admin.username }));
-  app.post('/api/password', adminAuth, (req, res) => {
+
+  app.get('/api/me', auth, (req, res) => {
+    const c = companyById(req.companyId);
+    res.json({
+      username: req.user.username, role: req.user.role, product: PRODUCT, brandPhrase: getSetting('brandPhrase'),
+      company: c ? { id: c.id, name: c.name, status: c.status } : null,
+    });
+  });
+
+  app.post('/api/password', auth, (req, res) => {
     const { current, next: nextPass } = req.body || {};
-    if (typeof current !== 'string' || !verifyAdminPassword(current, req.admin.salt, req.admin.hash)) throw new HttpError(400, 'La clave actual no es correcta');
+    if (typeof current !== 'string' || !verifyAdminPassword(current, req.user.salt, req.user.hash)) throw new HttpError(400, 'La clave actual no es correcta');
     if (typeof nextPass !== 'string' || nextPass.length < 10) throw new HttpError(400, 'La clave nueva necesita 10 caracteres o más');
     const { salt, hash } = hashAdminPassword(nextPass);
-    q('UPDATE admins SET salt=?, hash=? WHERE id=?').run(salt, hash, req.admin.id);
-    q('DELETE FROM sessions WHERE admin_id=? AND token_hash<>?').run(req.admin.id, sha256(readCookie(req)));
-    audit(req.admin.username, 'cambio de clave');
+    q('UPDATE users SET salt=?, hash=? WHERE id=?').run(salt, hash, req.user.id);
+    q('DELETE FROM sessions WHERE user_id=? AND token_hash<>?').run(req.user.id, sha256(readCookie(req)));
+    audit(req.companyId, actor(req), 'cambio de clave');
+    res.json({ ok: true });
+  });
+
+  /** El administrador general elige qué empresa administrar (o ninguna, para volver a la vista general). */
+  app.post('/api/context', superOnly, (req, res) => {
+    const id = req.body?.companyId ?? null;
+    if (id !== null && !companyById(id)) throw new HttpError(404, 'Empresa inexistente');
+    q('UPDATE sessions SET company_id=? WHERE token_hash=?').run(id, sha256(readCookie(req)));
+    res.json({ ok: true });
+  });
+
+  // ---- Configuración general y empresas (administrador general) ------------------------
+  app.get('/api/settings', superOnly, (req, res) => res.json({ brandPhrase: getSetting('brandPhrase'), graceDays: Number(getSetting('graceDays')) }));
+  app.put('/api/settings', superOnly, (req, res) => {
+    const b = req.body || {};
+    const phrase = String(b.brandPhrase ?? '').trim().slice(0, 40);
+    const grace = Number(b.graceDays);
+    if (!Number.isInteger(grace) || grace < 0 || grace > 365) throw new HttpError(400, 'Los días de gracia van de 0 a 365');
+    setSetting('brandPhrase', phrase);
+    setSetting('graceDays', grace);
+    audit(null, actor(req), 'configuración', `frase "${phrase}", ${grace} días de gracia`);
+    wakeAll();
+    res.json({ brandPhrase: phrase, graceDays: grace });
+  });
+
+  const presentCompany = (c, counts) => {
+    const n = (sql) => q(`SELECT COUNT(*) AS n FROM devices WHERE company_id=? ${sql}`).get(c.id, ...(sql ? [now() - ONLINE_MS] : [])).n;
+    return {
+      id: c.id, name: c.name, status: c.status, notes: c.notes, createdAt: c.created_at,
+      suspendedAt: c.suspended_at, devicesSuspendAt: devicesSuspendAt(c), devicesSuspended: devicesSuspended(c),
+      devices: n(''), online: n('AND last_seen > ?'), monthDevices: counts.get(c.id) || 0,
+      admins: q(`SELECT username FROM users WHERE company_id=? AND role='admin' ORDER BY username`).all(c.id).map((u) => u.username),
+    };
+  };
+
+  app.get('/api/companies', superOnly, (req, res) => {
+    const counts = billing.monthCounts(billing.currentMonth());
+    res.json(q('SELECT * FROM companies ORDER BY name').all().map((c) => presentCompany(c, counts)));
+  });
+
+  const companyName = (b) => {
+    const name = String(b?.name || '').trim().slice(0, 60);
+    if (!name) throw new HttpError(400, 'Poné el nombre de la empresa');
+    return name;
+  };
+  const getCompany = (id) => {
+    const c = companyById(Number(id));
+    if (!c) throw new HttpError(404, 'Empresa inexistente');
+    return c;
+  };
+
+  function createUser({ username, password, role, companyId }) {
+    const u = String(username || '').trim();
+    if (!USERNAME_RE.test(u)) throw new HttpError(400, 'El usuario va de 3 a 40 caracteres: letras, números, punto, guion, guion bajo o @');
+    if (typeof password !== 'string' || password.length < 10) throw new HttpError(400, 'La clave necesita 10 caracteres o más');
+    if (q('SELECT 1 FROM users WHERE username=?').get(u)) throw new HttpError(409, `Ya existe el usuario ${u}`);
+    const { salt, hash } = hashAdminPassword(password);
+    return q('INSERT INTO users (username, salt, hash, role, company_id, created_at) VALUES (?,?,?,?,?,?)').run(u, salt, hash, role, companyId, now()).lastInsertRowid;
+  }
+
+  app.post('/api/companies', superOnly, (req, res) => {
+    const b = req.body || {};
+    const name = companyName(b);
+    if (q('SELECT 1 FROM companies WHERE name=?').get(name)) throw new HttpError(409, 'Ya existe una empresa con ese nombre');
+    db.exec('BEGIN');
+    let id;
+    try {
+      id = q('INSERT INTO companies (name, notes, created_at) VALUES (?,?,?)').run(name, String(b.notes || '').slice(0, 500), now()).lastInsertRowid;
+      q('INSERT INTO profiles (company_id, name, json, updated_at) VALUES (?,?,?,?)').run(id, 'General', JSON.stringify(DEFAULT_PROFILE), now());
+      if (b.adminUser) createUser({ username: b.adminUser, password: b.adminPassword, role: 'admin', companyId: id });
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+    audit(id, actor(req), 'empresa creada', name);
+    res.json(presentCompany(companyById(id), billing.monthCounts(billing.currentMonth())));
+  });
+
+  app.patch('/api/companies/:id', superOnly, (req, res) => {
+    const c = getCompany(req.params.id);
+    const name = req.body?.name !== undefined ? companyName(req.body) : c.name;
+    const clash = q('SELECT id FROM companies WHERE name=?').get(name);
+    if (clash && clash.id !== c.id) throw new HttpError(409, 'Ya existe una empresa con ese nombre');
+    const notes = req.body?.notes !== undefined ? String(req.body.notes).slice(0, 500) : c.notes;
+    q('UPDATE companies SET name=?, notes=? WHERE id=?').run(name, notes, c.id);
+    if (name !== c.name) audit(c.id, actor(req), 'empresa renombrada', `${c.name} → ${name}`);
+    wakeCompany(c.id);
+    res.json(presentCompany(companyById(c.id), billing.monthCounts(billing.currentMonth())));
+  });
+
+  /** Suspender: el panel de la empresa se corta ya; sus TV Box, al vencer los días de gracia. */
+  app.post('/api/companies/:id/suspend', superOnly, (req, res) => {
+    const c = getCompany(req.params.id);
+    if (c.status !== 'suspended') {
+      q(`UPDATE companies SET status='suspended', suspended_at=? WHERE id=?`).run(now(), c.id);
+      q('DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE company_id=?)').run(c.id);
+      audit(c.id, actor(req), 'empresa suspendida', `TV Box suspendidos en ${getSetting('graceDays')} días si no paga`);
+    }
+    wakeCompany(c.id);
+    res.json(presentCompany(companyById(c.id), billing.monthCounts(billing.currentMonth())));
+  });
+
+  /** Marcar pagada: vuelven el panel y los TV Box. */
+  app.post('/api/companies/:id/activate', superOnly, (req, res) => {
+    const c = getCompany(req.params.id);
+    q(`UPDATE companies SET status='active', suspended_at=NULL WHERE id=?`).run(c.id);
+    if (c.status !== 'active') audit(c.id, actor(req), 'empresa reactivada', 'pago registrado');
+    wakeCompany(c.id);
+    res.json(presentCompany(companyById(c.id), billing.monthCounts(billing.currentMonth())));
+  });
+
+  app.delete('/api/companies/:id', superOnly, (req, res) => {
+    const c = getCompany(req.params.id);
+    if (q('SELECT 1 FROM devices WHERE company_id=? LIMIT 1').get(c.id)) throw new HttpError(409, 'La empresa todavía tiene equipos. Eliminá o dá de baja sus equipos primero.');
+    const shas = q('SELECT sha FROM files WHERE company_id=?').all(c.id).map((r) => r.sha);
+    q('DELETE FROM companies WHERE id=?').run(c.id);
+    for (const sha of shas) dropBlobIfUnused(sha);
+    audit(null, actor(req), 'empresa eliminada', c.name);
+    res.json({ ok: true });
+  });
+
+  // ---- Facturación ------------------------------------------------------------------------
+  function billingReport(month) {
+    if (!/^\d{4}-\d{2}$/.test(month)) throw new HttpError(400, 'Mes inválido');
+    const counts = billing.monthCounts(month);
+    const companies = q('SELECT id, name, status FROM companies ORDER BY name').all();
+    // Una empresa eliminada que facturó ese mes sigue apareciendo con su número.
+    const rows = companies.map((c) => ({ companyId: c.id, name: c.name, status: c.status, devices: counts.get(c.id) || 0 }));
+    for (const [cid, n] of counts) if (!companies.some((c) => c.id === cid)) rows.push({ companyId: cid, name: `Empresa eliminada #${cid}`, status: 'deleted', devices: n });
+    return { month, closed: billing.isClosed(month), months: billing.months(), rows, total: rows.reduce((t, r) => t + r.devices, 0) };
+  }
+
+  app.get('/api/billing', superOnly, (req, res) => res.json(billingReport(String(req.query.month || billing.currentMonth()))));
+
+  /** CSV con punto y coma y BOM: Excel en español lo abre directo en columnas. */
+  const sendCsv = (res, filename, header, rows) => {
+    const cell = (v) => {
+      const s = String(v ?? '');
+      return /[;"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const text = [header, ...rows].map((r) => r.map(cell).join(';')).join('\r\n');
+    res.set('Content-Type', 'text/csv; charset=utf-8');
+    res.set('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(`﻿${text}\r\n`);
+  };
+  const STATUS_LABEL = { active: 'Activa', suspended: 'Suspendida', deleted: 'Eliminada' };
+
+  app.get('/api/billing.csv', superOnly, (req, res) => {
+    const r = billingReport(String(req.query.month || billing.currentMonth()));
+    sendCsv(res, `facturacion-${r.month}.csv`, ['Mes', 'Empresa', 'Estado', 'Equipos facturables', 'Mes cerrado'],
+      [...r.rows.map((x) => [r.month, x.name, STATUS_LABEL[x.status] || x.status, x.devices, r.closed ? 'Sí' : 'No, en curso']), [r.month, 'TOTAL', '', r.total, '']]);
+  });
+
+  app.get('/api/billing/:companyId/devices.csv', superOnly, (req, res) => {
+    const month = String(req.query.month || billing.currentMonth());
+    if (!/^\d{4}-\d{2}$/.test(month)) throw new HttpError(400, 'Mes inválido');
+    const cid = Number(req.params.companyId);
+    const name = companyById(cid)?.name || `empresa-${cid}`;
+    const detail = billing.deviceDetail(cid, month);
+    const safe = name.replace(/[^A-Za-z0-9_-]+/g, '-').slice(0, 40);
+    sendCsv(res, `equipos-${safe}-${month}.csv`, ['Mes', 'Empresa', 'Equipo', 'Primer día', 'Último día', 'Días registrado', 'ID'],
+      detail.map((d) => [month, name, d.name, d.firstDay, d.lastDay, d.days, d.deviceId]));
+  });
+
+  // ---- Usuarios -------------------------------------------------------------------------
+  const presentUser = (u) => ({ id: u.id, username: u.username, role: u.role, roleLabel: ROLE_LABEL[u.role], createdAt: u.created_at });
+
+  /** Sin empresa elegida, el administrador general ve a los otros administradores generales. */
+  app.get('/api/users', auth, (req, res) => {
+    if (isSuper(req) && !req.companyId) return res.json(q(`SELECT * FROM users WHERE role='superadmin' ORDER BY username`).all().map(presentUser));
+    if (!req.companyId || (!isSuper(req) && req.user.role !== 'admin')) throw new HttpError(403, 'Tu usuario no tiene permiso para esto');
+    res.json(q('SELECT * FROM users WHERE company_id=? ORDER BY role, username').all(req.companyId).map(presentUser));
+  });
+
+  /** Quién puede gestionar a quién: el general a todos; el administrador de empresa, solo a sus operadores. */
+  const canManage = (req, role) => (isSuper(req) ? true : req.user.role === 'admin' && role === 'operator');
+
+  app.post('/api/users', auth, (req, res) => {
+    const { username, password, role } = req.body || {};
+    if (!ROLE_LABEL[role]) throw new HttpError(400, 'Rol inválido');
+    if (!canManage(req, role)) throw new HttpError(403, 'Tu usuario no puede crear ese tipo de usuario');
+    const companyId = role === 'superadmin' ? null : req.companyId;
+    if (role !== 'superadmin' && !companyId) throw new HttpError(409, 'Elegí una empresa para administrar', 'no_company');
+    const id = createUser({ username, password, role, companyId });
+    audit(companyId, actor(req), 'usuario creado', `${username} (${ROLE_LABEL[role]})`);
+    res.json(presentUser(q('SELECT * FROM users WHERE id=?').get(id)));
+  });
+
+  const manageableUser = (req, id) => {
+    const u = q('SELECT * FROM users WHERE id=?').get(Number(id));
+    if (!u) throw new HttpError(404, 'Usuario inexistente');
+    const sameScope = u.role === 'superadmin' ? isSuper(req) : u.company_id === req.companyId || isSuper(req);
+    if (!sameScope || !canManage(req, u.role)) throw new HttpError(403, 'Tu usuario no puede modificar a ese usuario');
+    return u;
+  };
+
+  app.post('/api/users/:id/password', auth, (req, res) => {
+    const u = manageableUser(req, req.params.id);
+    const pass = req.body?.password;
+    if (typeof pass !== 'string' || pass.length < 10) throw new HttpError(400, 'La clave necesita 10 caracteres o más');
+    const { salt, hash } = hashAdminPassword(pass);
+    q('UPDATE users SET salt=?, hash=? WHERE id=?').run(salt, hash, u.id);
+    q('DELETE FROM sessions WHERE user_id=?').run(u.id);
+    audit(u.company_id, actor(req), 'clave reiniciada', u.username);
+    res.json({ ok: true });
+  });
+
+  app.delete('/api/users/:id', auth, (req, res) => {
+    const u = manageableUser(req, req.params.id);
+    if (u.id === req.user.id) throw new HttpError(400, 'No podés eliminar tu propio usuario');
+    if (u.role === 'superadmin' && q(`SELECT COUNT(*) AS n FROM users WHERE role='superadmin'`).get().n <= 1) throw new HttpError(400, 'Tiene que quedar al menos un administrador general');
+    q('DELETE FROM users WHERE id=?').run(u.id);
+    audit(u.company_id, actor(req), 'usuario eliminado', u.username);
     res.json({ ok: true });
   });
 
@@ -281,41 +577,44 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
     const cfg = deviceConfig(d);
     return {
       id: d.id, name: d.name, group: d.grp, notes: d.notes, profileId: d.profile_id, profileName: profile?.name || '',
-      blocked: !!d.blocked, blockTitle: d.block_title, blockMessage: d.block_message,
+      blocked: !!d.blocked, blockTitle: d.block_title, blockMessage: d.block_message, suspended: cfg.suspended,
       overrides: JSON.parse(d.app_overrides), state, publicIp: d.public_ip, lastSeen: d.last_seen, createdAt: d.created_at,
       online: waiters.has(d.id) || now() - d.last_seen < ONLINE_MS,
       synced: state.appliedConfig === cfg.version,
-      wallpaperSha: pj.wallpaperSha || '', title: pj.title || '', effectiveApps: cfg.apps.map((a) => a.package),
+      wallpaperSha: pj.wallpaperSha || '', title: cfg.title, effectiveApps: cfg.apps.map((a) => a.package),
     };
   };
 
-  app.get('/api/devices', adminAuth, (req, res) => {
-    res.json(q('SELECT * FROM devices ORDER BY grp, name').all().map(presentDevice));
+  app.get('/api/devices', STAFF, (req, res) => {
+    res.json(q('SELECT * FROM devices WHERE company_id=? ORDER BY grp, name').all(req.companyId).map(presentDevice));
   });
 
-  const getDevice = (id) => {
-    const d = q('SELECT * FROM devices WHERE id=?').get(id);
+  const getDevice = (req, id) => {
+    const d = q('SELECT * FROM devices WHERE id=? AND company_id=?').get(id, req.companyId);
     if (!d) throw new HttpError(404, 'Equipo inexistente');
     return d;
   };
 
-  app.get('/api/devices/:id', adminAuth, (req, res) => {
+  app.get('/api/devices/:id', STAFF, (req, res) => {
     expireOld();
-    const d = getDevice(req.params.id);
+    const d = getDevice(req, req.params.id);
     const commands = q('SELECT type, payload, status, detail, created_at AS createdAt, updated_at AS updatedAt FROM commands WHERE device_id=? ORDER BY created_at DESC LIMIT 30').all(d.id)
       .map((c) => ({ ...c, payload: JSON.parse(c.payload) }));
     res.json({ ...presentDevice(d), commands });
   });
 
-  app.patch('/api/devices/:id', adminAuth, (req, res) => {
-    const d = getDevice(req.params.id);
+  const validPackage = (p) => typeof p === 'string' && /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$/.test(p);
+  const profileOf = (req, id) => (id == null ? null : q('SELECT * FROM profiles WHERE id=? AND company_id=?').get(id, req.companyId));
+
+  app.patch('/api/devices/:id', ADMIN, (req, res) => {
+    const d = getDevice(req, req.params.id);
     const b = req.body || {};
     const name = typeof b.name === 'string' && b.name.trim() ? b.name.trim().slice(0, 80) : d.name;
     const grp = typeof b.group === 'string' ? b.group.trim().slice(0, 60) : d.grp;
     const notes = typeof b.notes === 'string' ? b.notes.slice(0, 500) : d.notes;
     let profileId = d.profile_id;
     if (b.profileId !== undefined) {
-      if (b.profileId !== null && !q('SELECT 1 FROM profiles WHERE id=?').get(b.profileId)) throw new HttpError(400, 'Perfil inexistente');
+      if (b.profileId !== null && !profileOf(req, b.profileId)) throw new HttpError(400, 'Perfil inexistente');
       profileId = b.profileId;
     }
     let overrides = d.app_overrides;
@@ -325,20 +624,18 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
     }
     q('UPDATE devices SET name=?, grp=?, notes=?, profile_id=?, app_overrides=? WHERE id=?').run(name, grp, notes, profileId, overrides, d.id);
     wake(d.id);
-    res.json(presentDevice(getDevice(d.id)));
+    res.json(presentDevice(getDevice(req, d.id)));
   });
 
-  app.delete('/api/devices/:id', adminAuth, (req, res) => {
-    const d = getDevice(req.params.id);
+  app.delete('/api/devices/:id', ADMIN, (req, res) => {
+    const d = getDevice(req, req.params.id);
     q('DELETE FROM devices WHERE id=?').run(d.id);
     wake(d.id);
-    audit(req.admin.username, 'equipo eliminado', d.name);
+    audit(req.companyId, actor(req), 'equipo eliminado', d.name);
     res.json({ ok: true });
   });
 
-  const validPackage = (p) => typeof p === 'string' && /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$/.test(p);
-
-  function validateCommand(action, payload) {
+  function validateCommand(req, action, payload) {
     if (action === 'message') {
       const title = String(payload.title || '').slice(0, 80);
       const body = String(payload.body || '').slice(0, 1000);
@@ -347,7 +644,7 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
       return { title, body, seconds, mode: payload.mode === 'banner' ? 'banner' : 'modal' };
     }
     if (action === 'install') {
-      const ref = apkRef(payload.sha);
+      const ref = apkRef(req.companyId, payload.sha);
       if (!ref) throw new HttpError(400, 'Elegí un APK de la biblioteca');
       return ref;
     }
@@ -360,10 +657,11 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
   }
 
   // Acciones sobre uno o varios equipos: el corazón del panel.
-  app.post('/api/devices/bulk', adminAuth, (req, res) => {
+  app.post('/api/devices/bulk', STAFF, (req, res) => {
     const { ids, action, payload = {} } = req.body || {};
+    if (req.user.role === 'operator' && !OPERATOR_ACTIONS.has(action)) throw new HttpError(403, 'Un operador solo puede enviar mensajes, bloquear y desbloquear');
     if (!Array.isArray(ids) || !ids.length) throw new HttpError(400, 'Seleccioná al menos un equipo');
-    const devices = ids.map((id) => q('SELECT id, name FROM devices WHERE id=?').get(id)).filter(Boolean);
+    const devices = ids.map((id) => q('SELECT id, name FROM devices WHERE id=? AND company_id=?').get(id, req.companyId)).filter(Boolean);
     if (!devices.length) throw new HttpError(404, 'Los equipos seleccionados ya no existen');
     const batch = crypto.randomUUID();
 
@@ -376,13 +674,13 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
         wake(d.id);
       }
     } else if (action === 'assignProfile') {
-      if (!q('SELECT 1 FROM profiles WHERE id=?').get(payload.profileId)) throw new HttpError(400, 'Perfil inexistente');
+      if (!profileOf(req, payload.profileId)) throw new HttpError(400, 'Perfil inexistente');
       for (const d of devices) {
         q('UPDATE devices SET profile_id=? WHERE id=?').run(payload.profileId, d.id);
         wake(d.id);
       }
     } else if (BULK_COMMANDS.has(action)) {
-      const clean = JSON.stringify(validateCommand(action, payload));
+      const clean = JSON.stringify(validateCommand(req, action, payload));
       for (const d of devices) {
         q(`INSERT INTO commands (id, device_id, batch_id, type, payload, created_at, updated_at, expires_at) VALUES (?,?,?,?,?,?,?,?)`)
           .run(crypto.randomUUID(), d.id, batch, action, clean, now(), now(), now() + MESSAGE_TTL_MS);
@@ -391,14 +689,14 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
     } else {
       throw new HttpError(400, 'Acción desconocida');
     }
-    audit(req.admin.username, ACTION_LABEL[action] || action, `${devices.length} equipo(s): ${devices.map((d) => d.name).join(', ')}`);
+    audit(req.companyId, actor(req), ACTION_LABEL[action] || action, `${devices.length} equipo(s): ${devices.map((d) => d.name).join(', ')}`);
     res.json({ ok: true, count: devices.length, batch });
   });
 
-  app.get('/api/sends', adminAuth, (req, res) => {
+  app.get('/api/sends', STAFF, (req, res) => {
     expireOld();
     const rows = q(`SELECT c.batch_id AS batch, c.type, c.payload, c.status, c.detail, c.created_at AS createdAt, d.name AS device
-                    FROM commands c JOIN devices d ON d.id = c.device_id ORDER BY c.created_at DESC LIMIT 500`).all();
+                    FROM commands c JOIN devices d ON d.id = c.device_id WHERE d.company_id=? ORDER BY c.created_at DESC LIMIT 500`).all(req.companyId);
     const batches = new Map();
     for (const r of rows) {
       if (!batches.has(r.batch)) batches.set(r.batch, { batch: r.batch, type: r.type, payload: JSON.parse(r.payload), createdAt: r.createdAt, items: [] });
@@ -407,29 +705,37 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
     res.json([...batches.values()]);
   });
 
-  app.get('/api/audit', adminAuth, (req, res) => res.json(q('SELECT ts, actor, action, detail FROM audit ORDER BY id DESC LIMIT 200').all()));
+  /** Actividad: la de la empresa elegida, o la general si el administrador general no eligió ninguna. */
+  app.get('/api/audit', auth, (req, res) => {
+    if (req.user.role === 'operator') throw new HttpError(403, 'Tu usuario no tiene permiso para esto');
+    const rows = req.companyId
+      ? q('SELECT ts, actor, action, detail FROM audit WHERE company_id=? ORDER BY id DESC LIMIT 200').all(req.companyId)
+      : q(`SELECT a.ts, a.actor, a.action, a.detail, c.name AS company FROM audit a LEFT JOIN companies c ON c.id = a.company_id ORDER BY a.id DESC LIMIT 200`).all();
+    res.json(rows);
+  });
 
   // Apps conocidas: lo que informan los equipos más la biblioteca. Alimenta el selector de perfiles.
-  app.get('/api/known-apps', adminAuth, (req, res) => {
+  app.get('/api/known-apps', ADMIN, (req, res) => {
     const known = new Map();
-    for (const d of q('SELECT state FROM devices').all()) {
+    for (const d of q('SELECT state FROM devices WHERE company_id=?').all(req.companyId)) {
       for (const a of JSON.parse(d.state).apps || []) {
         if (a.home) continue; // El launcher original nunca se ofrece como app permitida.
         if (!known.has(a.package)) known.set(a.package, { package: a.package, label: a.label, devices: 0 });
         known.get(a.package).devices++;
       }
     }
-    for (const f of q(`SELECT * FROM files WHERE kind='apk'`).all()) {
+    for (const f of q(`SELECT * FROM files WHERE kind='apk' AND company_id=?`).all(req.companyId)) {
       if (!known.has(f.package)) known.set(f.package, { package: f.package, label: f.name, devices: 0 });
     }
     res.json([...known.values()].sort((a, b) => a.label.localeCompare(b.label)));
   });
 
   // ---- Perfiles ---------------------------------------------------------------------------
-  function cleanProfile(b, previous) {
+  function cleanProfile(req, b, previous) {
+    const cid = req.companyId;
     const list = (l) => (Array.isArray(l) ? [...new Set(l.filter(validPackage))] : []);
     const apps = (Array.isArray(b.apps) ? b.apps : []).filter((a) => a && validPackage(a.package)).map((a) => ({
-      package: a.package, label: String(a.label || '').slice(0, 80), apkSha: apkRef(a.apkSha) ? a.apkSha : '',
+      package: a.package, label: String(a.label || '').slice(0, 80), apkSha: apkRef(cid, a.apkSha) ? a.apkSha : '',
     }));
     let exit = previous?.exit || null;
     const exitUser = String(b.exitUser ?? exit?.user ?? '').trim();
@@ -441,12 +747,12 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
       throw new HttpError(400, 'Para cambiar el usuario de salida, escribí también la clave');
     }
     return {
-      title: String(b.title ?? 'WiFly').slice(0, 60),
+      title: String(b.title ?? '').trim().slice(0, 60),
       showClock: b.showClock !== false,
       allowWifi: b.allowWifi !== false,
       adbAllowed: b.adbAllowed === true,
-      wallpaperSha: fileBySha(b.wallpaperSha)?.kind === 'image' ? b.wallpaperSha : '',
-      launcherApkSha: apkRef(b.launcherApkSha) ? b.launcherApkSha : '',
+      wallpaperSha: fileOf(cid, b.wallpaperSha)?.kind === 'image' ? b.wallpaperSha : '',
+      launcherApkSha: apkRef(cid, b.launcherApkSha) ? b.launcherApkSha : '',
       apps,
       removePackages: list(b.removePackages),
       helpers: list(b.helpers),
@@ -467,34 +773,34 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
     return name;
   };
 
-  app.get('/api/profiles', adminAuth, (req, res) => res.json(q('SELECT * FROM profiles ORDER BY name').all().map(presentProfile)));
+  app.get('/api/profiles', ADMIN, (req, res) => res.json(q('SELECT * FROM profiles WHERE company_id=? ORDER BY name').all(req.companyId).map(presentProfile)));
 
-  app.post('/api/profiles', adminAuth, (req, res) => {
+  app.post('/api/profiles', ADMIN, (req, res) => {
     const name = profileName(req.body);
-    if (q('SELECT 1 FROM profiles WHERE name=?').get(name)) throw new HttpError(409, 'Ya existe un perfil con ese nombre');
-    const r = q('INSERT INTO profiles (name, json, updated_at) VALUES (?,?,?)').run(name, JSON.stringify(cleanProfile(req.body, null)), now());
-    audit(req.admin.username, 'perfil creado', name);
+    if (q('SELECT 1 FROM profiles WHERE name=? AND company_id=?').get(name, req.companyId)) throw new HttpError(409, 'Ya existe un perfil con ese nombre');
+    const r = q('INSERT INTO profiles (company_id, name, json, updated_at) VALUES (?,?,?,?)').run(req.companyId, name, JSON.stringify(cleanProfile(req, req.body, null)), now());
+    audit(req.companyId, actor(req), 'perfil creado', name);
     res.json(presentProfile(q('SELECT * FROM profiles WHERE id=?').get(r.lastInsertRowid)));
   });
 
-  app.put('/api/profiles/:id', adminAuth, (req, res) => {
-    const row = q('SELECT * FROM profiles WHERE id=?').get(req.params.id);
+  app.put('/api/profiles/:id', ADMIN, (req, res) => {
+    const row = profileOf(req, Number(req.params.id));
     if (!row) throw new HttpError(404, 'Perfil inexistente');
     const name = profileName(req.body);
-    const clash = q('SELECT id FROM profiles WHERE name=?').get(name);
+    const clash = q('SELECT id FROM profiles WHERE name=? AND company_id=?').get(name, req.companyId);
     if (clash && clash.id !== row.id) throw new HttpError(409, 'Ya existe un perfil con ese nombre');
-    q('UPDATE profiles SET name=?, json=?, updated_at=? WHERE id=?').run(name, JSON.stringify(cleanProfile(req.body, JSON.parse(row.json))), now(), row.id);
+    q('UPDATE profiles SET name=?, json=?, updated_at=? WHERE id=?').run(name, JSON.stringify(cleanProfile(req, req.body, JSON.parse(row.json))), now(), row.id);
     wakeProfile(row.id);
-    audit(req.admin.username, 'perfil guardado', name);
+    audit(req.companyId, actor(req), 'perfil guardado', name);
     res.json(presentProfile(q('SELECT * FROM profiles WHERE id=?').get(row.id)));
   });
 
-  app.delete('/api/profiles/:id', adminAuth, (req, res) => {
-    const row = q('SELECT * FROM profiles WHERE id=?').get(req.params.id);
+  app.delete('/api/profiles/:id', ADMIN, (req, res) => {
+    const row = profileOf(req, Number(req.params.id));
     if (!row) throw new HttpError(404, 'Perfil inexistente');
     if (q('SELECT COUNT(*) AS n FROM devices WHERE profile_id=?').get(row.id).n) throw new HttpError(409, 'Pasá los equipos a otro perfil antes de eliminar este');
     q('DELETE FROM profiles WHERE id=?').run(row.id);
-    audit(req.admin.username, 'perfil eliminado', row.name);
+    audit(req.companyId, actor(req), 'perfil eliminado', row.name);
     res.json({ ok: true });
   });
 
@@ -502,16 +808,23 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
   const upload = multer({ dest: tmpDir, limits: { fileSize: maxUploadMb * 1024 * 1024 } });
   const presentFile = (f) => ({ sha: f.sha, kind: f.kind, name: f.name, size: f.size, package: f.package, versionCode: f.version_code, versionName: f.version_name, createdAt: f.created_at, parts: f.parts ? JSON.parse(f.parts).length : 0 });
   const labelOf = (m, fallback) => (typeof m.application?.label === 'string' && !m.application.label.startsWith('resourceId:') ? m.application.label : fallback);
-  const insertFile = q(`INSERT OR REPLACE INTO files (sha, kind, name, size, mime, package, version_code, version_name, parts, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`);
+  const insertFile = q(`INSERT OR REPLACE INTO files (company_id, sha, kind, name, size, mime, package, version_code, version_name, parts, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`);
   const APK_MIME = 'application/vnd.android.package-archive';
+  /** Si el contenido ya está guardado (otra empresa subió el mismo archivo), no se duplica en disco. */
+  const storeBlob = (tmp, sha) => {
+    const dest = path.join(filesDir, sha);
+    if (fs.existsSync(dest)) fs.unlinkSync(tmp);
+    else fs.renameSync(tmp, dest);
+  };
 
   const hashFile = (p) => new Promise((resolve, reject) => {
     const h = crypto.createHash('sha256');
     fs.createReadStream(p).on('data', (d) => h.update(d)).on('error', reject).on('end', () => resolve(h.digest('hex')));
   });
 
-  app.post('/api/files', adminAuth, upload.single('file'), async (req, res, next) => {
+  app.post('/api/files', ADMIN, upload.single('file'), async (req, res, next) => {
     const tmp = req.file?.path;
+    const cid = req.companyId;
     try {
       if (!tmp) throw new HttpError(400, 'Elegí un archivo');
       const fd = fs.openSync(tmp, 'r');
@@ -520,91 +833,91 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
       fs.closeSync(fd);
       const original = Buffer.from(req.file.originalname, 'latin1').toString('utf8').slice(0, 120);
       const sha = await hashFile(tmp);
-      let row;
       const image = IMAGE_MAGIC.find((m) => m.test(head));
       if (req.body.kind === 'image') {
         if (!image) throw new HttpError(400, 'La imagen tiene que ser JPG, PNG o WebP');
-        row = { kind: 'image', mime: image.mime, name: original };
-      } else if (req.body.kind === 'apk') {
-        const found = await inspectUpload(tmp, tmpDir, maxUploadMb * 2 * 1024 * 1024);
-        const fallback = original.replace(/\.(apk|apks|xapk|apkm)$/i, '');
-        if (found.kind === 'split' && found.parts.length > 1) {
-          // App dividida: cada parte se guarda por su SHA-256 y el registro de la app las enumera.
-          const { base, parts } = found;
-          for (const p of parts) {
-            fs.renameSync(p.tmp, path.join(filesDir, p.sha));
-            insertFile.run(p.sha, 'part', p.split || 'base', p.size, APK_MIME, p.package, p.versionCode, p.versionName, null, now());
-          }
-          fs.unlinkSync(tmp);
-          const list = parts.map((p) => ({ sha: p.sha, split: p.split, size: p.size }));
-          insertFile.run(sha, 'apk', labelOf(base.manifest, fallback), parts.reduce((n, p) => n + p.size, 0), APK_MIME, base.package, base.versionCode, base.versionName, JSON.stringify(list), now());
-          audit(req.admin.username, 'archivo subido', `apk dividida ${base.package} (${parts.length} partes)`);
-          return res.json({ ...presentFile(fileBySha(sha)), warning: found.warning });
-        }
-        let single = tmp, singleSha = sha, singleSize = req.file.size;
-        if (found.kind === 'split') {
-          // Un paquete con solo el APK base: se guarda como APK común.
-          const p = found.parts[0];
-          fs.unlinkSync(tmp);
-          single = p.tmp; singleSha = p.sha; singleSize = p.size;
-        }
-        const m = await readApkManifest(single);
-        if (m.split) throw new HttpError(400, 'Es una parte suelta de una app dividida. Subí el paquete completo (.apks, .xapk o .apkm).');
-        fs.renameSync(single, path.join(filesDir, singleSha));
-        insertFile.run(singleSha, 'apk', labelOf(m, fallback), singleSize, APK_MIME, m.package, m.versionCode || 0, String(m.versionName ?? ''), null, now());
-        audit(req.admin.username, 'archivo subido', `apk ${m.package}`);
-        return res.json({ ...presentFile(fileBySha(singleSha)), warning: found.warning || '' });
-      } else {
-        throw new HttpError(400, 'Tipo de archivo desconocido');
+        storeBlob(tmp, sha);
+        insertFile.run(cid, sha, 'image', original, req.file.size, image.mime, null, null, null, null, now());
+        audit(cid, actor(req), 'archivo subido', `imagen ${original}`);
+        return res.json(presentFile(fileOf(cid, sha)));
       }
-      fs.renameSync(tmp, path.join(filesDir, sha));
-      insertFile.run(sha, row.kind, row.name, req.file.size, row.mime, null, null, null, null, now());
-      audit(req.admin.username, 'archivo subido', `${row.kind} ${row.name}`);
-      res.json(presentFile(fileBySha(sha)));
+      if (req.body.kind !== 'apk') throw new HttpError(400, 'Tipo de archivo desconocido');
+      const found = await inspectUpload(tmp, tmpDir, maxUploadMb * 2 * 1024 * 1024);
+      const fallback = original.replace(/\.(apk|apks|xapk|apkm)$/i, '');
+      if (found.kind === 'split' && found.parts.length > 1) {
+        // App dividida: cada parte se guarda por su SHA-256 y el registro de la app las enumera.
+        const { base, parts } = found;
+        for (const p of parts) {
+          storeBlob(p.tmp, p.sha);
+          insertFile.run(cid, p.sha, 'part', p.split || 'base', p.size, APK_MIME, p.package, p.versionCode, p.versionName, null, now());
+        }
+        fs.unlinkSync(tmp);
+        const list = parts.map((p) => ({ sha: p.sha, split: p.split, size: p.size }));
+        insertFile.run(cid, sha, 'apk', labelOf(base.manifest, fallback), parts.reduce((n, p) => n + p.size, 0), APK_MIME, base.package, base.versionCode, base.versionName, JSON.stringify(list), now());
+        audit(cid, actor(req), 'archivo subido', `apk dividida ${base.package} (${parts.length} partes)`);
+        return res.json({ ...presentFile(fileOf(cid, sha)), warning: found.warning });
+      }
+      let single = tmp, singleSha = sha, singleSize = req.file.size;
+      if (found.kind === 'split') {
+        // Un paquete con solo el APK base: se guarda como APK común.
+        const p = found.parts[0];
+        fs.unlinkSync(tmp);
+        single = p.tmp; singleSha = p.sha; singleSize = p.size;
+      }
+      const m = await readApkManifest(single);
+      if (m.split) {
+        if (single !== tmp) fs.rmSync(single, { force: true });
+        throw new HttpError(400, 'Es una parte suelta de una app dividida. Subí el paquete completo (.apks, .xapk o .apkm).');
+      }
+      storeBlob(single, singleSha);
+      insertFile.run(cid, singleSha, 'apk', labelOf(m, fallback), singleSize, APK_MIME, m.package, m.versionCode || 0, String(m.versionName ?? ''), null, now());
+      audit(cid, actor(req), 'archivo subido', `apk ${m.package}`);
+      return res.json({ ...presentFile(fileOf(cid, singleSha)), warning: found.warning || '' });
     } catch (e) {
       if (tmp && fs.existsSync(tmp)) fs.unlinkSync(tmp);
       next(e instanceof BundleError ? new HttpError(400, e.message) : e);
     }
   });
 
-  app.get('/api/files', adminAuth, (req, res) => res.json(q(`SELECT * FROM files WHERE kind <> 'part' ORDER BY created_at DESC`).all().map(presentFile)));
-  app.get('/api/files/:sha/content', adminAuth, (req, res) => sendStored(res, req.params.sha));
+  app.get('/api/files', ADMIN, (req, res) => res.json(q(`SELECT * FROM files WHERE company_id=? AND kind <> 'part' ORDER BY created_at DESC`).all(req.companyId).map(presentFile)));
+  app.get('/api/files/:sha/content', STAFF, (req, res) => sendStored(res, req.companyId, req.params.sha));
 
-  app.delete('/api/files/:sha', adminAuth, (req, res) => {
-    const f = fileBySha(req.params.sha);
-    if (!f) throw new HttpError(404, 'Archivo inexistente');
-    const used = q('SELECT name, json FROM profiles').all().find((p) => {
+  app.delete('/api/files/:sha', ADMIN, (req, res) => {
+    const cid = req.companyId;
+    const f = fileOf(cid, req.params.sha);
+    if (!f || f.kind === 'part') throw new HttpError(404, 'Archivo inexistente');
+    const used = q('SELECT name, json FROM profiles WHERE company_id=?').all(cid).find((p) => {
       const j = JSON.parse(p.json);
       return j.wallpaperSha === f.sha || j.launcherApkSha === f.sha || j.apps.some((a) => a.apkSha === f.sha);
     });
     if (used) throw new HttpError(409, `Lo usa el perfil ${used.name}`);
-    q('DELETE FROM files WHERE sha=?').run(f.sha);
-    fs.rmSync(path.join(filesDir, f.sha), { force: true });
-    // Las partes se borran salvo que otra app dividida las comparta.
-    const stillUsed = new Set(q('SELECT parts FROM files WHERE parts IS NOT NULL').all().flatMap((r) => JSON.parse(r.parts).map((p) => p.sha)));
+    q('DELETE FROM files WHERE company_id=? AND sha=?').run(cid, f.sha);
+    dropBlobIfUnused(f.sha);
+    // Las partes se borran salvo que otra app dividida de la empresa las comparta.
+    const stillUsed = new Set(q('SELECT parts FROM files WHERE company_id=? AND parts IS NOT NULL').all(cid).flatMap((r) => JSON.parse(r.parts).map((p) => p.sha)));
     for (const p of f.parts ? JSON.parse(f.parts) : []) {
       if (stillUsed.has(p.sha)) continue;
-      q(`DELETE FROM files WHERE sha=? AND kind='part'`).run(p.sha);
-      fs.rmSync(path.join(filesDir, p.sha), { force: true });
+      q(`DELETE FROM files WHERE company_id=? AND sha=? AND kind='part'`).run(cid, p.sha);
+      dropBlobIfUnused(p.sha);
     }
     res.json({ ok: true });
   });
 
   // ---- Tokens de alta -----------------------------------------------------------------------
   const presentToken = (t) => ({ token: t.token, label: t.label, profileId: t.profile_id, group: t.grp, uses: t.uses, maxUses: t.max_uses, expiresAt: t.expires_at, createdAt: t.created_at });
-  app.get('/api/enroll-tokens', adminAuth, (req, res) => res.json(q('SELECT * FROM enroll_tokens ORDER BY created_at DESC').all().map(presentToken)));
-  app.post('/api/enroll-tokens', adminAuth, (req, res) => {
+  app.get('/api/enroll-tokens', ADMIN, (req, res) => res.json(q('SELECT * FROM enroll_tokens WHERE company_id=? ORDER BY created_at DESC').all(req.companyId).map(presentToken)));
+  app.post('/api/enroll-tokens', ADMIN, (req, res) => {
     const b = req.body || {};
     const token = randomToken(12);
     const days = Math.max(0, Number(b.days) || 0);
-    const profile = b.profileId && q('SELECT 1 FROM profiles WHERE id=?').get(b.profileId) ? b.profileId : null;
-    q(`INSERT INTO enroll_tokens (token, label, profile_id, grp, max_uses, expires_at, created_at) VALUES (?,?,?,?,?,?,?)`)
-      .run(token, String(b.label || '').slice(0, 80), profile, String(b.group || '').slice(0, 60), Math.max(0, Number(b.maxUses) || 0), days ? now() + days * 86400_000 : 0, now());
-    audit(req.admin.username, 'token de alta creado', b.label || '');
+    const profile = b.profileId && profileOf(req, b.profileId) ? b.profileId : null;
+    q(`INSERT INTO enroll_tokens (token, company_id, label, profile_id, grp, max_uses, expires_at, created_at) VALUES (?,?,?,?,?,?,?,?)`)
+      .run(token, req.companyId, String(b.label || '').slice(0, 80), profile, String(b.group || '').slice(0, 60), Math.max(0, Number(b.maxUses) || 0), days ? now() + days * DAY_MS : 0, now());
+    audit(req.companyId, actor(req), 'token de alta creado', b.label || '');
     res.json(presentToken(q('SELECT * FROM enroll_tokens WHERE token=?').get(token)));
   });
-  app.delete('/api/enroll-tokens/:token', adminAuth, (req, res) => {
-    q('DELETE FROM enroll_tokens WHERE token=?').run(req.params.token);
+  app.delete('/api/enroll-tokens/:token', ADMIN, (req, res) => {
+    q('DELETE FROM enroll_tokens WHERE token=? AND company_id=?').run(req.params.token, req.companyId);
     res.json({ ok: true });
   });
 
@@ -613,12 +926,31 @@ export function createApp({ dataDir, adminUser = 'admin', adminPassword, secureC
 
   app.use((err, req, res, next) => {
     if (err instanceof multer.MulterError) return res.status(400).json({ error: `Archivo rechazado: ${err.message}` });
-    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, ...(err.code ? { code: err.code } : {}) });
     if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Solicitud demasiado grande' });
     if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'JSON inválido' });
     console.error(err);
     res.status(500).json({ error: 'Error interno del servidor' });
   });
 
-  return { app, db, generatedPassword, close: () => db.close() };
+  // ---- Tareas periódicas: conteo diario y cierre de meses; avisa a los TV Box cuando vence una gracia.
+  let lastSuspended = new Set();
+  const tick = () => {
+    try {
+      billing.tick();
+      const nowSuspended = new Set(q(`SELECT * FROM companies WHERE status='suspended'`).all().filter(devicesSuspended).map((c) => c.id));
+      for (const id of nowSuspended) if (!lastSuspended.has(id)) wakeCompany(id);
+      lastSuspended = nowSuspended;
+    } catch (e) {
+      console.error('tarea periódica', e);
+    }
+  };
+  tick();
+  const timer = billingIntervalMs ? setInterval(tick, billingIntervalMs) : null;
+  timer?.unref();
+
+  return {
+    app, db, generatedPassword, tick, billing,
+    close: () => { if (timer) clearInterval(timer); db.close(); },
+  };
 }

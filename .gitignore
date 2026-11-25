@@ -3,3 +3,4 @@ android/build/
 server/data/
 *.jks
 *.password.txt
+.v121/
