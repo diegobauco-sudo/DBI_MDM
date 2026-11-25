@@ -1,10 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createApp } from './app.js';
+import { applyPendingRestore } from './backup/restore.js';
 
 const dataDir = process.env.DATA_DIR || path.resolve('data');
 const port = Number(process.env.PORT || 8080);
 const publicUrl = process.env.PUBLIC_URL || '';
+
+// Una restauración completa pedida desde el panel se aplica acá, antes de abrir la base.
+fs.mkdirSync(dataDir, { recursive: true });
+applyPendingRestore(dataDir);
 
 const { app, generatedPassword } = createApp({
   dataDir,
@@ -14,6 +19,7 @@ const { app, generatedPassword } = createApp({
   trustProxy: process.env.TRUST_PROXY === '1',
   maxUploadMb: Number(process.env.MAX_UPLOAD_MB || 1024),
   updaterDir: process.env.UPDATER_DIR || '/updater',
+  publicUrl,
 });
 
 if (generatedPassword) {

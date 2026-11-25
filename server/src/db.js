@@ -19,9 +19,22 @@ export function openDb(dataDir) {
     if (hasV1) migrateFromV1(db);
     else createV2(db);
   }
+  // Esquema 3: respaldos. Se agrega igual sobre bases nuevas y migradas.
+  db.exec(BACKUP_TABLES);
+  if (db.prepare('PRAGMA user_version').get().user_version < 3) db.exec('PRAGMA user_version = 3');
   db.exec('PRAGMA foreign_keys = ON;');
   return db;
 }
+
+const BACKUP_TABLES = `
+  CREATE TABLE IF NOT EXISTS backup_configs (key TEXT PRIMARY KEY, json TEXT NOT NULL, updated_at INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS backup_runs (
+    id INTEGER PRIMARY KEY, key TEXT NOT NULL, trigger TEXT NOT NULL, actor TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL, started_at INTEGER NOT NULL, finished_at INTEGER, size INTEGER, filename TEXT,
+    detail TEXT, error TEXT
+  );
+  CREATE INDEX IF NOT EXISTS backup_runs_key ON backup_runs(key, id);
+`;
 
 const V2_TABLES = `
   CREATE TABLE IF NOT EXISTS companies (

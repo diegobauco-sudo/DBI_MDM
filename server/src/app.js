@@ -8,6 +8,7 @@ import { inspectUpload, readApkManifest, BundleError } from './bundle.js';
 import { openDb } from './db.js';
 import { createBilling } from './billing.js';
 import { createUpdates } from './updates.js';
+import { createBackups, BackupError } from './backup/service.js';
 import { randomToken, sha256, hashAdminPassword, verifyAdminPassword, hashExitPassword, rateLimiter } from './security.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -37,7 +38,7 @@ const DEFAULT_PROFILE = {
   wallpaperSha: '', launcherApkSha: '', apps: [], removePackages: [], helpers: [], exit: null,
 };
 
-const DEFAULT_SETTINGS = { brandPhrase: '', graceDays: '7', timezone: 'America/Argentina/Buenos_Aires' };
+const DEFAULT_SETTINGS = { brandPhrase: '', graceDays: '7', timezone: 'America/Argentina/Buenos_Aires', googleClientId: '', googleClientSecret: '' };
 
 class HttpError extends Error {
   constructor(status, message, code) { super(message); this.status = status; this.code = code; }
@@ -48,6 +49,7 @@ const USERNAME_RE = /^[A-Za-z0-9._@-]{3,40}$/;
 export function createApp({
   dataDir, adminUser = 'admin', adminPassword, secureCookies = false, trustProxy = false,
   longPollMs = 25_000, maxUploadMb = 1024, clock = Date.now, billingIntervalMs = 10 * 60_000, updaterDir = '/updater',
+  publicUrl = '', onRestart = () => setTimeout(() => process.exit(0), 800),
 }) {
   const db = openDb(dataDir);
   const filesDir = path.join(dataDir, 'files');
@@ -93,6 +95,14 @@ export function createApp({
   const wakeProfile = (profileId) => wakeWhere('profile_id = ?', profileId);
   const wakeCompany = (companyId) => wakeWhere('company_id = ?', companyId);
   const wakeAll = () => { for (const id of [...waiters.keys()]) wake(id); };
+
+  // ---- Respaldos ----------------------------------------------------------------------------
+  const backups = createBackups({
+    db, dataDir, filesDir: path.join(dataDir, 'files'), tmpDir: path.join(dataDir, 'tmp'), version: VERSION, now,
+    timezone: () => getSetting('timezone'), getSetting,
+    onCompanyRestored: (cid) => wakeCompany(cid),
+    onGeneralRestore: () => onRestart(),
+  });
 
   // ---- Archivos ---------------------------------------------------------------------------
   const fileOf = (companyId, sha) => (sha && typeof sha === 'string' ? q('SELECT * FROM files WHERE company_id=? AND sha=?').get(companyId, sha) : null);
@@ -370,7 +380,10 @@ export function createApp({
   });
 
   // ---- Configuración general y empresas (administrador general) ------------------------
-  app.get('/api/settings', superOnly, (req, res) => res.json({ brandPhrase: getSetting('brandPhrase'), graceDays: Number(getSetting('graceDays')) }));
+  app.get('/api/settings', superOnly, (req, res) => res.json({
+    brandPhrase: getSetting('brandPhrase'), graceDays: Number(getSetting('graceDays')),
+    googleClientId: getSetting('googleClientId'), googleSecretSet: !!getSetting('googleClientSecret'), googleRedirectUri: googleRedirect(req),
+  }));
   app.put('/api/settings', superOnly, (req, res) => {
     const b = req.body || {};
     const phrase = String(b.brandPhrase ?? '').trim().slice(0, 40);
@@ -378,6 +391,8 @@ export function createApp({
     if (!Number.isInteger(grace) || grace < 0 || grace > 365) throw new HttpError(400, 'Los días de gracia van de 0 a 365');
     setSetting('brandPhrase', phrase);
     setSetting('graceDays', grace);
+    if (b.googleClientId !== undefined) setSetting('googleClientId', String(b.googleClientId).trim().slice(0, 200));
+    if (b.googleClientSecret) setSetting('googleClientSecret', String(b.googleClientSecret).trim().slice(0, 200));
     audit(null, actor(req), 'configuración', `frase "${phrase}", ${grace} días de gracia`);
     wakeAll();
     res.json({ brandPhrase: phrase, graceDays: grace });
@@ -476,6 +491,7 @@ export function createApp({
     const shas = q('SELECT sha FROM files WHERE company_id=?').all(c.id).map((r) => r.sha);
     q('DELETE FROM companies WHERE id=?').run(c.id);
     for (const sha of shas) dropBlobIfUnused(sha);
+    backups.forgetCompany(c.id);
     audit(null, actor(req), 'empresa eliminada', c.name);
     res.json({ ok: true });
   });
@@ -499,6 +515,77 @@ export function createApp({
     const s = updates.request('update', target);
     audit(null, actor(req), 'actualización pedida', `${s.current} → ${target}`);
     return s;
+  }));
+
+  // ---- Respaldos: "general" (administrador general) o "empresa" (la empresa que se administra) ------
+  const googleRedirect = (req) => `${(publicUrl || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '')}/api/backups/google/callback`;
+  /** Resuelve el alcance y controla el permiso. Los operadores nunca acceden a respaldos. */
+  const backupScope = [auth, (req, res, next) => {
+    const scope = req.params.scope;
+    if (scope === 'general') {
+      if (!isSuper(req)) return res.status(403).json({ error: 'Solo el administrador general maneja el respaldo del sistema' });
+      req.backupKey = backups.keyFor(null);
+    } else if (scope === 'empresa') {
+      if (!req.companyId) return res.status(409).json({ error: 'Elegí una empresa para administrar', code: 'no_company' });
+      if (!isSuper(req) && req.user.role !== 'admin') return res.status(403).json({ error: 'Tu usuario no tiene permiso para esto' });
+      req.backupKey = backups.keyFor(req.companyId);
+    } else {
+      return res.status(404).json({ error: 'Ruta inexistente' });
+    }
+    next();
+  }];
+  /** Express 4 no atrapa errores de funciones async: esto los manda al manejador común. */
+  const aw = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch((e) => next(e instanceof BackupError ? new HttpError(e.status, e.message) : e));
+  const auditKey = (req) => (req.backupKey === 'general' ? null : req.companyId);
+
+  app.get('/api/backups/google/callback', aw(async (req, res) => {
+    const back = (msg, ok) => res.redirect(`/#backups-google=${ok ? 'ok' : 'error'}&msg=${encodeURIComponent(msg)}`);
+    if (req.query.error) return back(req.query.error === 'access_denied' ? 'Cancelaste la conexión con Google' : `Google respondió: ${req.query.error}`, false);
+    try {
+      const r = await backups.googleCallback(String(req.query.state || ''), String(req.query.code || ''));
+      audit(r.key === 'general' ? null : Number(r.key.slice(8)), 'google', 'Google Drive conectado', r.email);
+      return back(`Google Drive conectado${r.email ? ` como ${r.email}` : ''}`, true);
+    } catch (e) {
+      return back(e.message, false);
+    }
+  }));
+
+  app.get('/api/backups/:scope', backupScope, (req, res) => res.json({ ...backups.present(req.backupKey), googleRedirectUri: googleRedirect(req) }));
+  app.put('/api/backups/:scope', backupScope, aw(async (req, res) => {
+    const r = backups.save(req.backupKey, req.body || {});
+    audit(auditKey(req), actor(req), 'respaldos configurados', req.backupKey === 'general' ? 'sistema' : 'empresa');
+    res.json({ ...r, googleRedirectUri: googleRedirect(req) });
+  }));
+  app.post('/api/backups/:scope/test/:destId', backupScope, aw(async (req, res) => res.json(await backups.test(req.backupKey, req.params.destId))));
+  app.post('/api/backups/:scope/run', backupScope, aw(async (req, res) => {
+    const { id, done } = backups.start(req.backupKey, 'manual', actor(req));
+    audit(auditKey(req), actor(req), 'respaldo manual', req.backupKey === 'general' ? 'sistema' : 'empresa');
+    done.catch(() => {});
+    res.json({ id });
+  }));
+  app.get('/api/backups/:scope/remote', backupScope, aw(async (req, res) => res.json(await backups.remote(req.backupKey))));
+  app.get('/api/backups/:scope/google/start/:destId', backupScope, aw(async (req, res) => res.json({ url: backups.googleStart(req.backupKey, req.params.destId, googleRedirect(req)) })));
+  app.get('/api/backups/:scope/download/:destId/:name', backupScope, aw(async (req, res) => {
+    const file = await backups.download(req.backupKey, req.params.destId, req.params.name);
+    res.download(file, req.params.name, () => fs.rmSync(file, { force: true }));
+  }));
+
+  const restoreDone = (req, res, r) => {
+    audit(auditKey(req), actor(req), 'respaldo restaurado', r.kind === 'general' ? 'sistema completo' : `${r.devices} equipos, ${r.profiles} perfiles${r.skipped.length ? `; omitido: ${r.skipped.join(', ')}` : ''}`);
+    res.json(r);
+  };
+  app.post('/api/backups/:scope/restore', backupScope, aw(async (req, res) => {
+    const { destId, name, password } = req.body || {};
+    restoreDone(req, res, await backups.restoreRemote(req.backupKey, String(destId || ''), String(name || ''), String(password || '')));
+  }));
+  const backupUpload = multer({ dest: path.join(dataDir, 'tmp'), limits: { fileSize: maxUploadMb * 4 * 1024 * 1024 } });
+  app.post('/api/backups/:scope/restore-file', backupScope, backupUpload.single('file'), aw(async (req, res) => {
+    if (!req.file) throw new HttpError(400, 'Elegí el archivo de respaldo (.wfbk)');
+    try {
+      restoreDone(req, res, await backups.restoreFile(req.backupKey, req.file.path, String(req.body.password || '')));
+    } finally {
+      fs.rmSync(req.file.path, { force: true });
+    }
   }));
 
   // ---- Facturación ------------------------------------------------------------------------
@@ -975,9 +1062,12 @@ export function createApp({
   tick();
   const timer = billingIntervalMs ? setInterval(tick, billingIntervalMs) : null;
   timer?.unref();
+  const backupTimer = billingIntervalMs ? setInterval(() => backups.tick().catch((e) => console.error('respaldos', e)), 5 * 60_000) : null;
+  backupTimer?.unref();
 
   return {
     app, db, generatedPassword, tick, billing, version: VERSION,
-    close: () => { if (timer) clearInterval(timer); db.close(); },
+    backups,
+    close: () => { if (timer) clearInterval(timer); if (backupTimer) clearInterval(backupTimer); db.close(); },
   };
 }
