@@ -896,10 +896,11 @@ async function viewSettings() {
   const phrase = h('input', { type: 'text', id: 's-ph', maxlength: 40, value: settings.brandPhrase, placeholder: 'por DBI', oninput: () => paint() });
   const grace = h('input', { type: 'number', id: 's-gr', min: 0, max: 365, value: settings.graceDays });
   const sample = h('div', { class: 'brand-sample' });
-  const paint = () => sample.replaceChildren(h('span', { class: 'brand-name' }, 'Hotel Sur'), phrase.value ? h('span', { class: 'brand-phrase' }, phrase.value) : null);
+  const paint = () => sample.replaceChildren(...[h('span', { class: 'brand-name' }, 'Hotel Sur'), phrase.value ? h('span', { class: 'brand-phrase' }, phrase.value) : null].filter(Boolean));
   paint();
   fill(
     header('Configuración'),
+    updatesSheet(),
     h('div', { class: 'sheet' }, h('h2', {}, 'Marca'),
       h('p', {}, `El sistema se llama ${me.product}. Cada empresa se muestra con su nombre y esta frase debajo, más chica, en su panel y en sus TV Box.`),
       h('label', { for: 's-ph' }, 'Frase fija'), phrase,
@@ -914,4 +915,80 @@ async function viewSettings() {
       }) }, 'Guardar configuración'))),
     usersSheet(users, [['superadmin', 'Administrador general']], 'Administradores generales', 'Pueden ver y administrar todas las empresas.'),
     h('div', { class: 'sheet' }, h('h2', {}, 'Actividad general'), auditTable(audit)));
+}
+
+// ---- Actualizaciones desde GitHub ------------------------------------------------------------------
+const UPDATE_STATE = {
+  idle: ['Al día', 'ok'], pending: ['Esperando al actualizador', 'warn'], checking: ['Buscando versiones', 'warn'],
+  updating: ['Actualizando', 'warn'], done: ['Actualizado', 'ok'], rolled_back: ['Falló, se volvió a la versión anterior', 'bad'], error: ['Error', 'bad'],
+};
+
+/** Mientras el servidor se reinicia el panel pierde conexión: sigue preguntando hasta que vuelve. */
+function updatesSheet() {
+  const box = h('div', { class: 'sheet' });
+  let timer = null;
+  let offline = false;
+  let shownVersion = null;
+
+  const schedule = (ms) => {
+    clearTimeout(timer);
+    timer = setTimeout(load, ms);
+  };
+  const prevStop = stopTimer;
+  stopTimer = () => { clearTimeout(timer); prevStop(); };
+
+  async function load() {
+    if (!box.isConnected) return;
+    let st;
+    try {
+      const r = await fetch('/api/updates', { headers: { 'x-wifly': '1' } });
+      if (r.status === 401) return showLogin('El servidor se actualizó. Volvé a entrar.');
+      st = await r.json();
+      if (!r.ok) throw new Error(st.error);
+    } catch {
+      offline = true;
+      box.replaceChildren(h('h2', {}, 'Actualizaciones'), h('div', { class: 'note' }, 'El servidor se está reiniciando con la versión nueva. Esta página vuelve sola en cuanto responda.'));
+      return schedule(4000);
+    }
+    if (offline && shownVersion && st.current !== shownVersion) {
+      toast(`Servidor actualizado a ${st.current}. Recargando el panel…`);
+      return setTimeout(() => location.reload(), 1500);
+    }
+    offline = false;
+    shownVersion = st.current;
+    paint(st);
+    if (['pending', 'checking', 'updating'].includes(st.state)) schedule(3000);
+  }
+
+  function paint(st) {
+    const [label, tone] = st.state === 'idle' && st.available.length ? ['Hay una versión nueva', 'warn'] : UPDATE_STATE[st.state] || [st.state, ''];
+    const busy = ['pending', 'checking', 'updating'].includes(st.state);
+    if (!st.enabled) {
+      box.replaceChildren(h('h2', {}, 'Actualizaciones'),
+        h('p', {}, `Versión instalada: `, h('strong', {}, st.current), '.'),
+        h('div', { class: 'note' }, 'Las actualizaciones desde GitHub no están activadas en este servidor. Se activan una sola vez desde la consola del CT con:'),
+        h('pre', {}, 'cd /root/wifly/server\nsudo ./actualizador/activar-actualizaciones.sh usuario/repositorio'));
+      return;
+    }
+    const newest = st.available[st.available.length - 1];
+    box.replaceChildren(...[
+      h('h2', {}, 'Actualizaciones'),
+      h('p', {}, 'Versión instalada: ', h('strong', {}, st.current), '. Repositorio: ', h('code', {}, st.repo), '. ',
+        h('span', { class: `pill ${tone}` }, label)),
+      st.message ? h('p', {}, st.message) : null,
+      st.lastCheck ? h('p', { class: 'hint' }, `Última búsqueda: ${dateTime(st.lastCheck)}.`) : null,
+      h('div', { class: 'wrap-actions' },
+        h('button', { disabled: busy, onclick: guard(async () => { paint(await api('POST', '/api/updates/check', {})); schedule(2000); }) }, 'Buscar actualizaciones'),
+        newest ? h('button', { class: 'primary', disabled: busy, onclick: () => confirmDialog(`Actualizar a ${newest}`,
+          `Se respaldan los datos, el panel y los TV Box se desconectan entre 1 y 3 minutos, y el servidor arranca con ${newest}. Si la versión nueva no responde, vuelve sola a ${st.current} con sus datos. Los TV Box siguen funcionando durante la actualización.`,
+          `Actualizar a ${newest}`, false, async () => { paint(await api('POST', '/api/updates/apply', { version: newest })); schedule(2000); }) }, `Actualizar a ${newest}`) : null),
+      st.available.length > 1 ? h('p', { class: 'hint' }, `Versiones nuevas disponibles: ${st.available.join(', ')}. Se instala la más reciente.`) : null,
+      st.log.length ? h('details', { open: busy || ['error', 'rolled_back'].includes(st.state) }, h('summary', {}, 'Registro'), h('pre', {}, st.log.join('\n'))) : null,
+    ].filter(Boolean));
+  }
+
+  box.append(h('h2', {}, 'Actualizaciones'), h('p', { class: 'hint' }, 'Cargando…'));
+  // Se carga cuando la sección ya está en la página.
+  schedule(0);
+  return box;
 }

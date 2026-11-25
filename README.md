@@ -110,7 +110,7 @@ Desde la versión 2.0, un mismo servidor administra varias empresas por separado
    ```bash
    cd /root/wifly/server
    docker compose stop wifly
-   docker compose cp wifly:/data /root/respaldo-wifly-$(date +%F)
+   docker compose cp -a wifly:/data /root/respaldo-wifly-$(date +%F)
    ```
 
 2. **Actualizá** con el zip nuevo:
@@ -125,7 +125,43 @@ Desde la versión 2.0, un mismo servidor administra varias empresas por separado
 3. **Entrá con el usuario de siempre.** Ahora es administrador general. Todos los equipos, perfiles, archivos y tokens quedan en la empresa **Empresa principal**: cambiale el nombre en **Empresas, Editar**. Los equipos siguen conectados sin hacer nada.
 4. En **Configuración**, cargá la frase fija y los días de gracia.
 
-**Para volver a la versión anterior:** `docker compose down`, descomprimí el zip de la 1.2.1, copiá el respaldo de vuelta con `docker compose cp /root/respaldo-wifly-FECHA/. wifly:/data` y `docker compose up -d --build`.
+**Para volver a la versión anterior:** `docker compose down`, descomprimí el zip de la 1.2.1, copiá el respaldo de vuelta con `docker compose cp -a /root/respaldo-wifly-FECHA/. wifly:/data` y `docker compose up -d --build`.
+
+## Actualizar desde GitHub
+
+Desde la versión 2.1.0, el administrador general actualiza el servidor desde el panel: **Configuración, Actualizaciones**. El panel muestra la versión instalada y las nuevas publicadas en GitHub, y con **Actualizar** hace todo solo:
+
+1. Respalda los datos en `/root/wifly-respaldos` (guarda los últimos 5).
+2. Pasa el código a la versión nueva, reconstruye y arranca.
+3. Verifica que la versión nueva responda. Si no responde en 3 minutos, **vuelve sola a la versión anterior con sus datos**.
+
+El panel y los TV Box se desconectan entre 1 y 3 minutos; los TV Box siguen funcionando con su última configuración.
+
+### Activarlo (una sola vez por servidor)
+
+Requiere el servidor en 2.1.0 o más, instalado como indica "Actualizar un servidor 1.x". Dentro del CT:
+
+```bash
+cd /root/wifly/server
+sudo ./actualizador/activar-actualizaciones.sh usuario/repositorio
+```
+
+El script crea una **clave de despliegue de solo lectura** y la muestra: agregala en GitHub, en el repositorio, **Settings, Deploy keys, Add deploy key**, sin marcar "Allow write access". El servidor solo puede leer ese repositorio y nada más de tu cuenta. Después el script instala el servicio que atiende los pedidos del panel.
+
+### Publicar una versión nueva
+
+Con los cambios guardados en el repositorio:
+
+```bash
+tools/publicar-version.sh 2.2.0
+```
+
+Pone la versión en `server/package.json`, corre las pruebas, crea la etiqueta `v2.2.0` y la sube. Los servidores la ven al tocar **Buscar actualizaciones**. Si las pruebas fallan, no publica nada.
+
+### Lo que no se actualiza por acá
+
+- **WiFly Launcher** en los TV Box: se actualiza subiendo el APK nuevo a **Biblioteca** y eligiéndolo en el perfil.
+- **La clave de firma** (`wifly-release.jks`) y el archivo `.env` del servidor nunca se suben a GitHub.
 
 ## Apps divididas (.apks, .xapk, .apkm)
 

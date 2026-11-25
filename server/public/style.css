@@ -204,3 +204,5 @@ h2.spaced { margin-top: 1.4rem; }
 table.companies .row-actions { flex-wrap: nowrap; }
 table.companies td:first-child { min-width: 9rem; }
 table.companies .row-actions > * { flex: none; white-space: nowrap; }
+details summary { cursor: pointer; font-weight: 700; margin-top: .8rem; }
+details pre { max-height: 18rem; overflow: auto; }
