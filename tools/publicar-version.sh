@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Publica una versión nueva del servidor en GitHub. Los servidores la ven al tocar "Buscar actualizaciones".
+# Sube solo la rama; la etiqueta la crea GitHub Actions cuando pasan las pruebas.
 # Uso, desde la carpeta del proyecto, con los cambios ya guardados (commit):
 #   tools/publicar-version.sh 2.2.0
 # La versión de server/package.json y la etiqueta tienen que coincidir: el actualizador lo verifica.
@@ -18,6 +19,6 @@ if [ "$CUR" != "$V" ]; then
   git commit -qam "Versión $V"
 fi
 (cd server && npm test >/dev/null) || { echo "Las pruebas fallan: no se publica."; exit 1; }
-git tag -a "v$V" -m "WiFly MDM $V"
-git push origin HEAD "v$V"
-echo "Publicada v$V."
+# Se sube solo la rama: GitHub corre las pruebas y crea la etiqueta v$V (.github/workflows/publicar-version.yml).
+git push origin HEAD:main
+echo "Subida la versión $V. En unos minutos GitHub crea la etiqueta v$V (pestaña Actions del repositorio)."

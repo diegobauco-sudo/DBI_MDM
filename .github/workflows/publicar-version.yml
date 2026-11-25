@@ -1,0 +1,49 @@
+# Publica la versión automáticamente: cuando llega código a main, corre las pruebas y, si pasan,
+# crea la etiqueta vX.Y.Z según server/package.json. Los servidores la ven en "Buscar actualizaciones".
+# Así se puede publicar subiendo solo la rama, sin tener que subir etiquetas.
+name: Publicar versión
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publicar-version
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Instalar dependencias del servidor
+        working-directory: server
+        run: npm ci
+
+      - name: Pruebas
+        working-directory: server
+        run: npm test
+
+      - name: Crear la etiqueta de la versión
+        run: |
+          V="v$(node -p "require('./server/package.json').version")"
+          if git rev-parse -q --verify "refs/tags/$V" >/dev/null; then
+            echo "La versión $V ya estaba publicada. Para publicar otra, subí la versión en server/package.json."
+            exit 0
+          fi
+          git config user.name "WiFly publicación"
+          git config user.email "actions@users.noreply.github.com"
+          git tag -a "$V" -m "WiFly MDM $V"
+          git push origin "$V"
+          echo "Publicada $V"
