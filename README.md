@@ -180,6 +180,41 @@ Pone la versión en `server/package.json`, corre las pruebas, crea la etiqueta `
 - **WiFly Launcher** en los TV Box: se actualiza subiendo el APK nuevo a **Biblioteca** y eligiéndolo en el perfil.
 - **La clave de firma** (`wifly-release.jks`) y el archivo `.env` del servidor nunca se suben a GitHub.
 
+## Respaldos
+
+Desde la versión 2.2.0 hay dos tipos de respaldo, cada uno en su sección **Respaldos**:
+
+| | Respaldo del sistema | Respaldo de empresa |
+|---|---|---|
+| Lo maneja | El administrador general | El administrador de cada empresa (o el general, administrándola) |
+| Incluye | Todo: empresas, usuarios, equipos, perfiles, archivos, facturación y configuración | Usuarios, perfiles, equipos, tokens y apps de esa empresa |
+| Restaurar | Todo el sistema vuelve a ese momento; el servidor se reinicia | Solo esa empresa; las demás y la facturación no se tocan |
+
+- **Destinos:** SFTP, FTPS y Google Drive. Conviene usar dos, en lugares distintos. El FTP sin cifrar no se permite.
+- **Programación:** todos los días o una vez por semana, a la hora elegida, o solo manual con **Respaldar ahora**.
+- **Copias a guardar:** al llegar a ese número, se borra la más vieja en cada destino.
+- **Cifrado:** cada respaldo se cifra con AES-256 y la contraseña que define quien lo configura. **Sin esa contraseña no se puede restaurar.** Guardala fuera del servidor.
+- **SFTP** guarda la huella del servidor en la primera conexión y después rechaza cualquier otro servidor que se haga pasar por él.
+- **Restaurar el sistema completo** deja antes una copia del estado actual dentro del volumen de datos (`pre-restore-FECHA`, se conservan las dos últimas).
+- Se puede restaurar desde un destino o subiendo un archivo `.wfbk` desde la PC, y descargar cualquier respaldo desde el panel.
+
+### Crear la aplicación de Google (una sola vez, para usar Google Drive)
+
+La hace el administrador general en [Google Cloud Console](https://console.cloud.google.com/), con cualquier cuenta de Google:
+
+1. **Creá un proyecto**, por ejemplo "WiFly MDM".
+2. En **APIs y servicios, Biblioteca**, buscá **Google Drive API** y tocá **Habilitar**.
+3. En **Google Auth Platform** (o **Pantalla de consentimiento de OAuth**): poné nombre de la app y correo de soporte, elegí público **Externo**, y en **Acceso a datos** agregá solo el permiso `.../auth/drive.file`.
+4. En **Público**, tocá **Publicar aplicación** para pasarla a **En producción**. Si queda "En prueba", Google corta el permiso cada 7 días y los respaldos a Drive dejan de funcionar. Con solo `drive.file`, normalmente Google no pide verificación.
+5. En **Clientes**, creá un cliente de tipo **Aplicación web** y en **URI de redireccionamiento autorizados** pegá la dirección que muestra WiFly en **Configuración, Aplicación de Google Drive** (por ejemplo `https://hmdm.wifly.net.ar/api/backups/google/callback`).
+6. Copiá el **ID de cliente** y el **Secreto de cliente** en **Configuración, Aplicación de Google Drive** y guardá.
+
+Después, en cada sección **Respaldos**, agregá un destino Google Drive y tocá **Conectar con Google**. WiFly solo puede ver y tocar los archivos que crea él, en su propia carpeta.
+
+### Espacio en disco
+
+Durante un respaldo, el servidor necesita espacio libre de aproximadamente dos veces el tamaño de los datos (el archivo comprimido y su versión cifrada). Se borran al terminar.
+
 ## Apps divididas (.apks, .xapk, .apkm)
 
 Muchas apps de Play Store vienen divididas en varias partes. En **Biblioteca** se pueden subir así, igual que un APK común:
@@ -238,7 +273,7 @@ Si una app no llega a abrir su pantalla de inicio de sesión, agregá el paquete
 - **Android anterior a 7.1.1** puede rechazar certificados de Let's Encrypt. Probá la conexión antes de comprar equipos así de viejos.
 - **Google Play Protect** puede avisar al instalar, porque el APK no viene de Play.
 - **Docker** se entregó sin ejecutar. `enroll.sh` y `enrolar.ps1` se probaron con un `adb` simulado; `enrolar.ps1`, con PowerShell 7 y sin sintaxis exclusiva de esa versión, pero no en un Windows real.
-- El panel tiene un solo usuario administrador. No se midió cuántos equipos soporta un servidor.
+- No se midió cuántos equipos soporta un servidor.
 
 ## Compilar y firmar
 

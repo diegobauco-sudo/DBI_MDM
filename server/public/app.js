@@ -125,6 +125,7 @@ function showLogin(message) {
 const VIEWS = [
   ['companies', 'Empresas', viewCompanies, 'g'],
   ['billing', 'Facturación', viewBilling, 'g'],
+  ['backups', 'Respaldos', () => viewBackups('general'), 'g'],
   ['settings', 'Configuración', viewSettings, 'g'],
   ['wall', 'Pantallas', viewWall, 'ao'],
   ['profiles', 'Perfiles', viewProfiles, 'a'],
@@ -132,6 +133,7 @@ const VIEWS = [
   ['sends', 'Envíos', viewSends, 'ao'],
   ['enroll', 'Alta de equipos', viewEnroll, 'a'],
   ['users', 'Usuarios', viewUsers, 'a'],
+  ['cbackups', 'Respaldos', () => viewBackups('empresa'), 'a'],
   ['account', 'Cuenta', viewAccount, 'gao'],
 ];
 let current = 'wall';
@@ -174,7 +176,14 @@ async function start() {
         h('button', { onclick: guard(async () => { await api('POST', '/api/logout', {}); showLogin(); }) }, 'Salir'))),
     $main));
   const first = isSuper() && !me.company ? 'companies' : 'wall';
-  go(location.hash.slice(1) || first);
+  const hash = location.hash.slice(1);
+  if (hash.startsWith('backups-google=')) {
+    // Google vuelve acá después de conectar Drive.
+    const p = new URLSearchParams(hash);
+    setTimeout(() => toast(p.get('msg') || '', p.get('backups-google') !== 'ok'), 300);
+    return go(me.company && allowed('a') ? 'cbackups' : 'backups');
+  }
+  go(hash || first);
 }
 
 async function setContext(companyId) {
@@ -893,6 +902,8 @@ async function viewBilling() {
 // ---- Configuración general ------------------------------------------------------------------------
 async function viewSettings() {
   const [settings, users, audit] = await Promise.all([api('GET', '/api/settings'), api('GET', '/api/users'), api('GET', '/api/audit')]);
+  const gid = h('input', { type: 'text', id: 's-gid', value: settings.googleClientId, placeholder: '123456-abc.apps.googleusercontent.com', autocomplete: 'off' });
+  const gsecret = h('input', { type: 'password', id: 's-gsec', autocomplete: 'new-password', placeholder: settings.googleSecretSet ? 'Guardado. Dejalo vacío para no cambiarlo' : '' });
   const phrase = h('input', { type: 'text', id: 's-ph', maxlength: 40, value: settings.brandPhrase, placeholder: 'por DBI', oninput: () => paint() });
   const grace = h('input', { type: 'number', id: 's-gr', min: 0, max: 365, value: settings.graceDays });
   const sample = h('div', { class: 'brand-sample' });
@@ -913,6 +924,17 @@ async function viewSettings() {
         me.brandPhrase = phrase.value.trim();
         toast('Configuración guardada. Los TV Box la reciben en unos segundos.');
       }) }, 'Guardar configuración'))),
+    h('div', { class: 'sheet' }, h('h2', {}, 'Aplicación de Google Drive'),
+      h('p', {}, 'Para que los respaldos se guarden en Google Drive, WiFly necesita una aplicación de Google propia. Se crea una sola vez en Google Cloud; los pasos están en la guía, sección "Respaldos".'),
+      h('label', {}, 'Dirección de retorno autorizada (copiala en Google Cloud)'), h('pre', {}, settings.googleRedirectUri),
+      h('label', { for: 's-gid' }, 'ID de cliente'), gid,
+      h('label', { for: 's-gsec' }, 'Secreto de cliente'), gsecret,
+      h('p', { class: 'hint' }, 'WiFly pide solo permiso para los archivos que crea él mismo: no puede ver el resto del Drive.'),
+      h('div', { class: 'save-bar' }, h('button', { class: 'primary', onclick: guard(async () => {
+        await api('PUT', '/api/settings', { brandPhrase: phrase.value, graceDays: Number(grace.value), googleClientId: gid.value, googleClientSecret: gsecret.value });
+        gsecret.value = '';
+        toast('Aplicación de Google guardada');
+      }) }, 'Guardar aplicación de Google'))),
     usersSheet(users, [['superadmin', 'Administrador general']], 'Administradores generales', 'Pueden ver y administrar todas las empresas.'),
     h('div', { class: 'sheet' }, h('h2', {}, 'Actividad general'), auditTable(audit)));
 }
@@ -991,4 +1013,220 @@ function updatesSheet() {
   // Se carga cuando la sección ya está en la página.
   schedule(0);
   return box;
+}
+
+// ---- Respaldos --------------------------------------------------------------------------------------
+const WEEKDAYS = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+const RUN_STATE = { running: ['En curso', 'warn'], ok: ['Correcto', 'ok'], partial: ['Incompleto', 'warn'], error: ['Falló', 'bad'] };
+const DEST_HELP = {
+  sftp: 'Un servidor o NAS con acceso SSH. La primera conexión guarda su huella y después solo acepta ese mismo servidor.',
+  ftps: 'Un hosting o NAS con FTP sobre TLS (FTPS explícito). El FTP sin cifrar no se permite.',
+  gdrive: 'Una cuenta de Google. WiFly crea su propia carpeta y no ve el resto del Drive.',
+};
+
+async function viewBackups(scope) {
+  const general = scope === 'general';
+  let s = await api('GET', `/api/backups/${scope}`);
+  let timer = null;
+  const prevStop = stopTimer;
+  stopTimer = () => { clearTimeout(timer); prevStop(); };
+  const poll = () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      if (!$main.isConnected || current !== (general ? 'backups' : 'cbackups')) return;
+      s = await api('GET', `/api/backups/${scope}`).catch(() => s);
+      paint();
+      if (s.running) poll();
+    }, 2500);
+  };
+
+  // Se guarda la configuración entera; las claves vacías se conservan en el servidor.
+  const saveAll = async (patch = {}) => {
+    s = await api('PUT', `/api/backups/${scope}`, {
+      enabled: s.enabled, frequency: s.frequency, weekday: s.weekday, hour: s.hour, keep: s.keep, password: '',
+      destinations: s.destinations.map((d) => ({ id: d.id, type: d.type, name: d.name, config: { ...d.config } })), ...patch,
+    });
+    paint();
+  };
+
+  function scheduleSheet() {
+    const enabled = h('input', { type: 'checkbox', checked: s.enabled });
+    const freq = h('select', { id: 'b-f', onchange: () => { wd.hidden = freq.value !== 'weekly'; } },
+      [['daily', 'Todos los días'], ['weekly', 'Una vez por semana'], ['manual', 'Solo cuando toque "Respaldar ahora"']].map(([v, t]) => h('option', { value: v, selected: s.frequency === v }, t)));
+    const day = h('select', { id: 'b-d' }, WEEKDAYS.map((t, i) => h('option', { value: i, selected: s.weekday === i }, t)));
+    const wd = h('div', { hidden: s.frequency !== 'weekly' }, h('label', { for: 'b-d' }, 'Día'), day);
+    const hour = h('select', { id: 'b-h' }, Array.from({ length: 24 }, (_, i) => h('option', { value: i, selected: s.hour === i }, `${String(i).padStart(2, '0')}:00`)));
+    const keep = h('input', { type: 'number', id: 'b-k', min: 1, max: 365, value: s.keep });
+    const pass = h('input', { type: 'password', id: 'b-p', autocomplete: 'new-password', placeholder: s.passwordSet ? 'Guardada. Dejala vacía para no cambiarla' : '10 caracteres o más' });
+    return h('div', { class: 'sheet' }, h('h2', {}, 'Programación'),
+      h('label', { class: 'check' }, enabled, 'Hacer respaldos automáticos'),
+      h('label', { for: 'b-f' }, 'Frecuencia'), freq, wd,
+      h('label', { for: 'b-h' }, 'Hora'), hour,
+      h('label', { for: 'b-k' }, 'Copias a guardar en cada destino'), keep,
+      h('p', { class: 'hint' }, 'Al llegar a esa cantidad, se borra la más vieja.'),
+      h('label', { for: 'b-p' }, 'Contraseña de cifrado'), pass,
+      h('p', { class: 'hint' }, 'Cifra cada respaldo. Guardala en un lugar seguro: sin ella no se puede restaurar, ni siquiera nosotros.'),
+      h('div', { class: 'save-bar' }, h('button', { class: 'primary', onclick: guard(async () => {
+        await saveAll({ enabled: enabled.checked, frequency: freq.value, weekday: Number(day.value), hour: Number(hour.value), keep: Number(keep.value), password: pass.value });
+        toast('Programación guardada');
+      }) }, 'Guardar programación')));
+  }
+
+  function destDialog(existing) {
+    const type = h('select', { id: 'd-t', disabled: !!existing }, Object.entries({ sftp: 'SFTP', ftps: 'FTPS', gdrive: 'Google Drive' }).map(([v, t]) => h('option', { value: v, selected: existing?.type === v }, t)));
+    const fields = h('div');
+    const c = existing?.config || {};
+    const inp = {};
+    const paintFields = () => {
+      const t = type.value;
+      const mk = (k, label, props = {}) => { inp[k] = h('input', { id: `d-${k}`, type: 'text', value: c[k] ?? '', autocomplete: 'off', ...props }); return [h('label', { for: `d-${k}` }, label), inp[k]]; };
+      inp.name = h('input', { id: 'd-name', type: 'text', maxlength: 60, value: existing?.name || '' , placeholder: t === 'gdrive' ? 'Drive de la empresa' : 'NAS de la oficina' });
+      fields.replaceChildren(...[
+        h('p', { class: 'hint' }, DEST_HELP[t]),
+        h('label', { for: 'd-name' }, 'Nombre para reconocerlo'), inp.name,
+        ...(t === 'gdrive' ? [h('p', {}, 'Después de guardar, tocá "Conectar con Google" para elegir la cuenta.')] : [
+          ...mk('host', 'Servidor (nombre o IP)', { placeholder: 'nas.miempresa.com' }),
+          ...mk('port', 'Puerto', { type: 'number', value: c.port || (t === 'sftp' ? 22 : 21) }),
+          ...mk('username', 'Usuario'),
+          ...mk('password', 'Contraseña', { type: 'password', value: '', autocomplete: 'new-password', placeholder: c.passwordSet ? 'Guardada. Dejala vacía para no cambiarla' : '' }),
+          ...mk('dir', 'Carpeta en el servidor', { placeholder: 'respaldos/wifly' }),
+          t === 'ftps' ? h('label', { class: 'check' }, (inp.allowSelfSigned = h('input', { type: 'checkbox', checked: !!c.allowSelfSigned })), 'Aceptar certificado propio (solo si confiás en ese servidor)') : null,
+          t === 'sftp' && c.fingerprint ? h('label', { class: 'check' }, (inp.resetFingerprint = h('input', { type: 'checkbox' })), `Olvidar la huella guardada (${c.fingerprint})`) : null,
+        ]),
+      ].filter(Boolean));
+    };
+    paintFields();
+    type.addEventListener('change', paintFields);
+    const d = dialog(existing ? `Editar ${existing.name}` : 'Agregar destino', h('div', {}, h('label', { for: 'd-t' }, 'Tipo'), type, fields), [
+      h('button', { onclick: () => d.close() }, 'Cancelar'),
+      h('button', { class: 'primary', onclick: guard(async () => {
+        const t = type.value;
+        const config = {};
+        for (const k of ['host', 'port', 'username', 'password', 'dir']) if (inp[k]) config[k] = inp[k].value;
+        if (inp.allowSelfSigned) config.allowSelfSigned = inp.allowSelfSigned.checked;
+        if (inp.resetFingerprint?.checked) config.resetFingerprint = true;
+        const entry = { id: existing?.id, type: t, name: inp.name.value, config };
+        const list = s.destinations.map((x) => ({ id: x.id, type: x.type, name: x.name, config: { ...x.config } }));
+        if (existing) list[list.findIndex((x) => x.id === existing.id)] = entry; else list.push(entry);
+        await saveAll({ destinations: list });
+        d.close();
+        toast(existing ? 'Destino guardado' : (t === 'gdrive' ? 'Destino agregado. Ahora tocá "Conectar con Google".' : 'Destino agregado. Probá la conexión.'));
+      }) }, existing ? 'Guardar destino' : 'Agregar destino'),
+    ], 'wide');
+  }
+
+  function destDetail(d) {
+    if (d.type === 'gdrive') return d.config.email ? `Cuenta ${d.config.email}` : 'Sin conectar';
+    return `${d.config.username}@${d.config.host}:${d.config.port}${d.config.dir ? ` / ${d.config.dir}` : ''}`;
+  }
+
+  function destSheet() {
+    const rows = s.destinations.map((d) => h('tr', {},
+      h('td', {}, h('strong', {}, d.name), h('br'), h('small', {}, d.typeLabel, ' · ', destDetail(d))),
+      h('td', {}, d.lastResult ? [h('span', { class: `pill ${d.lastResult.ok ? 'ok' : 'bad'}` }, d.lastResult.ok ? 'Bien' : 'Error'), h('br'), h('small', {}, d.lastResult.message)] : h('span', { class: 'hint' }, 'Sin probar')),
+      h('td', {}, h('div', { class: 'row-actions' },
+        d.type === 'gdrive' ? h('button', { class: d.config.email ? '' : 'primary', disabled: !s.googleReady, title: s.googleReady ? '' : 'Falta configurar la aplicación de Google', onclick: guard(async () => {
+          location.href = (await api('GET', `/api/backups/${scope}/google/start/${d.id}`)).url;
+        }) }, d.config.email ? 'Cambiar cuenta' : 'Conectar con Google') : null,
+        h('button', { onclick: guard(async () => {
+          toast('Probando conexión…');
+          try { await api('POST', `/api/backups/${scope}/test/${d.id}`, {}); toast('Conexión correcta'); } finally { s = await api('GET', `/api/backups/${scope}`); paint(); }
+        }) }, 'Probar'),
+        h('button', { onclick: () => destDialog(d) }, 'Editar'),
+        h('button', { class: 'plain', onclick: () => confirmDialog('Quitar destino', `Se deja de respaldar en ${d.name}. Los respaldos que ya están ahí no se borran.`, 'Quitar destino', true, () => saveAll({ destinations: s.destinations.filter((x) => x.id !== d.id).map((x) => ({ id: x.id, type: x.type, name: x.name, config: { ...x.config } })) })) }, 'Quitar')))));
+    return h('div', { class: 'sheet' }, h('div', { class: 'sheet-head' }, h('h2', {}, 'Destinos'), h('button', { onclick: () => destDialog(null) }, 'Agregar destino')),
+      !s.googleReady && s.destinations.some((d) => d.type === 'gdrive') ? h('div', { class: 'note' }, isSuper() ? 'Falta cargar la aplicación de Google en Configuración para conectar Google Drive.' : 'El administrador general todavía no configuró la aplicación de Google. Pedíselo para poder conectar Google Drive.') : null,
+      rows.length ? h('div', { class: 'table-wrap' }, h('table', {}, h('tbody', {}, rows))) : h('p', { class: 'hint' }, 'Agregá dónde guardar los respaldos: un servidor SFTP, uno FTPS o Google Drive. Conviene tener dos, en lugares distintos.'));
+  }
+
+  function historySheet() {
+    if (!s.runs.length) return h('div', { class: 'sheet' }, h('h2', {}, 'Historial'), h('p', { class: 'hint' }, 'Todavía no se hizo ningún respaldo.'));
+    return h('div', { class: 'sheet' }, h('h2', {}, 'Historial'), h('div', { class: 'table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Fecha', 'Origen', 'Estado', 'Tamaño', 'Detalle'].map((t) => h('th', {}, t)))),
+      h('tbody', {}, s.runs.map((r) => {
+        const [label, tone] = RUN_STATE[r.status] || [r.status, ''];
+        return h('tr', {}, h('td', {}, dateTime(r.startedAt)), h('td', {}, r.trigger === 'programado' ? 'Programado' : `Manual, ${r.actor}`),
+          h('td', {}, h('span', { class: `pill ${tone}` }, label)), h('td', {}, r.size ? sizeOf(r.size) : ''),
+          h('td', {}, r.error ? h('div', {}, r.error) : null, r.results.map((x) => h('div', { class: x.ok ? '' : 'err-line' }, `${x.name}: ${x.ok ? 'subido' : x.error}${x.deleted?.length ? ` (borradas ${x.deleted.length} viejas)` : ''}`))));
+      })))));
+  }
+
+  function restoreDialog(source) {
+    const pass = h('input', { type: 'password', id: 'r-p', autocomplete: 'off' });
+    const text = general
+      ? 'Todo el sistema vuelve al momento de este respaldo: empresas, usuarios, equipos y configuración. Lo que se cambió después se pierde. El servidor se reinicia y el panel se desconecta un momento. Antes se guarda una copia del estado actual en el servidor.'
+      : `Los datos de ${me.company.name} (usuarios, perfiles, equipos, tokens y apps) vuelven al momento de este respaldo. Lo que se cambió después se pierde. Las demás empresas y la facturación no se tocan. Después vas a tener que volver a entrar.`;
+    const d = dialog('Restaurar respaldo', h('div', {}, h('p', {}, h('strong', {}, source.label)), h('div', { class: 'note bad' }, text),
+      h('label', { for: 'r-p' }, 'Contraseña de cifrado del respaldo'), pass), [
+      h('button', { onclick: () => d.close() }, 'Cancelar'),
+      h('button', { class: 'danger', onclick: guard(async () => {
+        toast('Restaurando…');
+        const r = await source.run(pass.value);
+        d.close();
+        if (r.kind === 'general') {
+          fill(header('Respaldos'), h('div', { class: 'sheet' }, h('h2', {}, 'Restaurando el sistema'), h('p', {}, 'El servidor se está reiniciando con el respaldo. En unos segundos vas a tener que volver a entrar.')));
+          setTimeout(() => location.reload(), 8000);
+          return;
+        }
+        toast(`Empresa restaurada${r.skipped.length ? `. Se omitió: ${r.skipped.join(', ')}` : ''}`, r.skipped.length > 0);
+        setTimeout(() => location.reload(), 2500);
+      }) }, 'Restaurar'),
+    ]);
+    pass.focus();
+  }
+
+  const remoteBox = h('div');
+  async function loadRemote() {
+    remoteBox.replaceChildren(h('p', { class: 'hint' }, 'Consultando los destinos…'));
+    const list = await api('GET', `/api/backups/${scope}/remote`);
+    const itemRow = (d, it) => h('tr', {},
+      h('td', {}, it.name),
+      h('td', {}, it.size ? sizeOf(it.size) : ''),
+      h('td', {}, h('div', { class: 'row-actions' },
+        h('a', { class: 'button', href: `/api/backups/${scope}/download/${d.destId}/${it.name}`, download: it.name }, 'Descargar'),
+        h('button', {
+          class: 'danger',
+          onclick: () => restoreDialog({
+            label: `${it.name}, desde ${d.name}`,
+            run: (password) => api('POST', `/api/backups/${scope}/restore`, { destId: d.destId, name: it.name, password }),
+          }),
+        }, 'Restaurar'))));
+    const destBlock = (d) => {
+      let body;
+      if (d.error) body = h('div', { class: 'note bad' }, d.error);
+      else if (!d.items.length) body = h('p', { class: 'hint' }, 'No hay respaldos.');
+      else body = h('div', { class: 'table-wrap' }, h('table', {}, h('tbody', {}, d.items.map((it) => itemRow(d, it)))));
+      return h('div', {}, h('h3', {}, d.name), body);
+    };
+    remoteBox.replaceChildren(...list.map(destBlock));
+    if (!list.length) remoteBox.replaceChildren(h('p', { class: 'hint' }, 'No hay destinos configurados.'));
+  }
+
+  function restoreSheet() {
+    const file = h('input', { type: 'file', accept: '.wfbk', 'aria-label': 'Archivo de respaldo' });
+    return h('div', { class: 'sheet' }, h('h2', {}, 'Restaurar'),
+      h('p', {}, general ? 'Volvé todo el sistema a un respaldo anterior.' : `Volvé los datos de ${me.company.name} a un respaldo anterior, sin tocar a las demás empresas.`),
+      h('div', { class: 'wrap-actions' }, h('button', { onclick: guard(loadRemote) }, 'Ver respaldos guardados')),
+      remoteBox,
+      h('h3', {}, 'Desde un archivo en tu PC'),
+      h('div', { class: 'upload-row' }, file, h('button', { class: 'danger', onclick: () => {
+        if (!file.files[0]) return toast('Elegí un archivo .wfbk', true);
+        restoreDialog({ label: file.files[0].name, run: (password) => { const fd = new FormData(); fd.set('password', password); fd.set('file', file.files[0]); return api('POST', `/api/backups/${scope}/restore-file`, fd); } });
+      } }, 'Restaurar este archivo')));
+  }
+
+  function paint() {
+    const last = s.runs[0];
+    fill(
+      header(general ? 'Respaldo del sistema' : 'Respaldos', h('span', { class: 'spacer' }),
+        h('button', { class: 'primary', disabled: s.running, onclick: guard(async () => { await api('POST', `/api/backups/${scope}/run`, {}); toast('Respaldo iniciado'); s = await api('GET', `/api/backups/${scope}`); paint(); poll(); }) }, s.running ? 'Respaldando…' : 'Respaldar ahora')),
+      h('p', {}, general
+        ? 'Copia todo el sistema: todas las empresas, usuarios, equipos, perfiles, archivos, facturación y configuración.'
+        : `Copia los datos de ${me.company.name}: usuarios, perfiles, equipos, tokens de alta y apps de la biblioteca.`,
+        ' ', s.enabled ? `Automático: ${s.frequency === 'weekly' ? `los ${WEEKDAYS[s.weekday].toLowerCase()}` : 'todos los días'} a las ${String(s.hour).padStart(2, '0')}:00.` : 'Sin respaldo automático.',
+        last ? ` Último: ${dateTime(last.startedAt)}, ${(RUN_STATE[last.status] || [last.status])[0].toLowerCase()}.` : ''),
+      scheduleSheet(), destSheet(), historySheet(), restoreSheet());
+  }
+  paint();
+  if (s.running) poll();
 }

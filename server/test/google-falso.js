@@ -11,6 +11,8 @@ export function fakeGoogle() {
   const idToken = (email) => `x.${Buffer.from(JSON.stringify({ email })).toString('base64url')}.y`;
   const authed = (req, res, next) => (tokens.has((req.get('authorization') || '').slice(7)) ? next() : res.status(401).json({ error: { message: 'token inválido' } }));
 
+  // Pantalla de consentimiento: aprueba sola y vuelve a WiFly con el código.
+  app.get('/auth', (req, res) => res.redirect(`${req.query.redirect_uri}?code=codigo-bueno&state=${encodeURIComponent(req.query.state)}`));
   app.post('/token', express.urlencoded({ extended: false }), (req, res) => {
     const b = req.body;
     if (b.client_secret !== 'secreto-google') return res.status(401).json({ error: 'invalid_client' });
