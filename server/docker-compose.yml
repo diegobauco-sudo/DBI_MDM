@@ -7,8 +7,11 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       PUBLIC_URL: https://${DOMAIN}
       TRUST_PROXY: "1"
+      UPDATER_DIR: /updater
     volumes:
       - wifly-data:/data
+      # Pedidos y estado del actualizador (actualizador/activar-actualizaciones.sh).
+      - ./updater:/updater
   caddy:
     image: caddy:2
     restart: unless-stopped

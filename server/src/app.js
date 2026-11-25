@@ -7,9 +7,11 @@ import { fileURLToPath } from 'node:url';
 import { inspectUpload, readApkManifest, BundleError } from './bundle.js';
 import { openDb } from './db.js';
 import { createBilling } from './billing.js';
+import { createUpdates } from './updates.js';
 import { randomToken, sha256, hashAdminPassword, verifyAdminPassword, hashExitPassword, rateLimiter } from './security.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const VERSION = JSON.parse(fs.readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version;
 const ONLINE_MS = 70_000;
 const SESSION_MS = 12 * 3600_000;
 const MESSAGE_TTL_MS = 7 * 24 * 3600_000;
@@ -45,7 +47,7 @@ const USERNAME_RE = /^[A-Za-z0-9._@-]{3,40}$/;
 
 export function createApp({
   dataDir, adminUser = 'admin', adminPassword, secureCookies = false, trustProxy = false,
-  longPollMs = 25_000, maxUploadMb = 1024, clock = Date.now, billingIntervalMs = 10 * 60_000,
+  longPollMs = 25_000, maxUploadMb = 1024, clock = Date.now, billingIntervalMs = 10 * 60_000, updaterDir = '/updater',
 }) {
   const db = openDb(dataDir);
   const filesDir = path.join(dataDir, 'files');
@@ -59,6 +61,7 @@ export function createApp({
   const setSetting = (key, value) => q('INSERT INTO settings (key, value) VALUES (?,?) ON CONFLICT (key) DO UPDATE SET value=excluded.value').run(key, String(value));
   const graceMs = () => Number(getSetting('graceDays')) * DAY_MS;
   const billing = createBilling(db, { now, timezone: () => getSetting('timezone') });
+  const updates = createUpdates({ dir: updaterDir, version: VERSION, now });
 
   // ---- Datos iniciales ------------------------------------------------------------------
   let generatedPassword = null;
@@ -154,6 +157,9 @@ export function createApp({
     next();
   });
   app.use(express.json({ limit: '2mb' }));
+
+  /** Sin sesión: lo usa el actualizador para confirmar que la versión nueva arrancó. */
+  app.get('/api/health', (req, res) => res.json({ ok: true, version: VERSION }));
 
   // ---- API de los equipos -----------------------------------------------------------------
   const enrollLimiter = rateLimiter({ max: 20, windowMs: 10 * 60_000 });
@@ -473,6 +479,27 @@ export function createApp({
     audit(null, actor(req), 'empresa eliminada', c.name);
     res.json({ ok: true });
   });
+
+  // ---- Actualizaciones desde GitHub (administrador general) --------------------------------
+  const updateCall = (fn) => (req, res) => {
+    try {
+      res.json(fn(req));
+    } catch (e) {
+      throw new HttpError(e.status || 500, e.message);
+    }
+  };
+  app.get('/api/updates', superOnly, (req, res) => res.json(updates.status()));
+  app.post('/api/updates/check', superOnly, updateCall((req) => {
+    const s = updates.request('check');
+    audit(null, actor(req), 'buscar actualizaciones');
+    return s;
+  }));
+  app.post('/api/updates/apply', superOnly, updateCall((req) => {
+    const target = String(req.body?.version || '');
+    const s = updates.request('update', target);
+    audit(null, actor(req), 'actualización pedida', `${s.current} → ${target}`);
+    return s;
+  }));
 
   // ---- Facturación ------------------------------------------------------------------------
   function billingReport(month) {
@@ -950,7 +977,7 @@ export function createApp({
   timer?.unref();
 
   return {
-    app, db, generatedPassword, tick, billing,
+    app, db, generatedPassword, tick, billing, version: VERSION,
     close: () => { if (timer) clearInterval(timer); db.close(); },
   };
 }

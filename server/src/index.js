@@ -13,6 +13,7 @@ const { app, generatedPassword } = createApp({
   secureCookies: publicUrl.startsWith('https://'),
   trustProxy: process.env.TRUST_PROXY === '1',
   maxUploadMb: Number(process.env.MAX_UPLOAD_MB || 1024),
+  updaterDir: process.env.UPDATER_DIR || '/updater',
 });
 
 if (generatedPassword) {

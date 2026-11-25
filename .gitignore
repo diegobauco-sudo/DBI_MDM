@@ -4,3 +4,5 @@ server/data/
 *.jks
 *.password.txt
 .v121/
+.env
+server/updater/
