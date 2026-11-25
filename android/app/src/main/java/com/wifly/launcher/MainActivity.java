@@ -158,6 +158,10 @@ public class MainActivity extends Activity {
         JSONObject cfg = Config.remote(this);
         String title = cfg.optString("title");
         ((TextView) findViewById(R.id.title)).setText(title.isEmpty() ? "WiFly" : title);
+        TextView phrase = (TextView) findViewById(R.id.brand_phrase);
+        String brand = cfg.optString("brandPhrase");
+        phrase.setText(brand);
+        phrase.setVisibility(brand.isEmpty() ? View.GONE : View.VISIBLE);
         TextClock clock = (TextClock) findViewById(R.id.clock);
         clock.setVisibility(cfg.optBoolean("showClock", true) ? View.VISIBLE : View.GONE);
         renderWallpaper();

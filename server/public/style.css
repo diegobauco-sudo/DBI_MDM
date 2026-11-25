@@ -177,3 +177,30 @@ dialog.drawer { margin: 0 0 0 auto; height: 100vh; max-height: 100vh; width: min
   .actionbar { animation: rise .16s ease-out; }
   @keyframes rise { from { transform: translateY(100%); } }
 }
+
+/* Multiempresa */
+.brand-text { display: flex; flex-direction: column; line-height: 1.15; min-width: 0; }
+.brand-name { overflow-wrap: anywhere; }
+.brand-phrase { font-size: .72rem; font-weight: 400; opacity: .8; }
+.rail-company { margin: .9rem 0 .4rem; padding: .7rem .65rem; border-top: 1px solid #34426B; border-bottom: 1px solid #34426B; display: flex; flex-direction: column; gap: .15rem; }
+.rail-company strong { color: #fff; overflow-wrap: anywhere; }
+.rail-label { font-size: .78rem; opacity: .75; }
+.rail .rail-back { padding: .3rem 0; color: var(--signal-bright); font-size: .88rem; }
+.rail .bottom { display: flex; flex-direction: column; gap: .15rem; }
+th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr.total td { font-weight: 700; border-top: 1.5px solid var(--ink); }
+.brand-sample { display: inline-flex; flex-direction: column; background: var(--bezel); color: #fff; padding: .7rem 1rem; border-radius: 5px; margin: .2rem 0 .4rem; }
+.brand-sample .brand-name { font-size: 1.3rem; font-weight: 700; }
+.brand-sample .brand-phrase { font-size: .8rem; }
+.preview .tv-brand { display: flex; flex-direction: column; line-height: 1.1; }
+.preview .tv-brand small { font-weight: 400; font-size: .7rem; opacity: .85; }
+h2.spaced { margin-top: 1.4rem; }
+.head select { width: auto; }
+@media (max-width: 760px) {
+  .rail-company { margin: 0; padding: 0 .4rem; border: 0; flex-direction: row; align-items: center; gap: .4rem; white-space: nowrap; }
+  .rail .bottom { flex-direction: row; }
+  .brand-text { display: none; }
+}
+table.companies .row-actions { flex-wrap: nowrap; }
+table.companies td:first-child { min-width: 9rem; }
+table.companies .row-actions > * { flex: none; white-space: nowrap; }

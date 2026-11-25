@@ -37,6 +37,14 @@ async function api(method, url, body) {
     showLogin();
     throw new Error('La sesión venció. Volvé a entrar.');
   }
+  if (data.code === 'suspended' && url !== '/api/login') {
+    showLogin(data.error);
+    throw new Error(data.error);
+  }
+  if (data.code === 'no_company') {
+    go('companies');
+    throw new Error(data.error);
+  }
   if (!r.ok) throw new Error(data.error || `Error ${r.status}`);
   return data;
 }
@@ -84,10 +92,11 @@ function confirmDialog(title, text, label, danger, run) {
 
 // ---- Ingreso --------------------------------------------------------------------------------
 let stopTimer = () => {};
-function showLogin() {
+function showLogin(message) {
   stopTimer();
+  document.querySelector('.actionbar')?.remove();
   document.querySelectorAll('dialog').forEach((d) => d.remove());
-  const err = h('p', { class: 'err', hidden: true });
+  const err = h('p', { class: 'err', hidden: !message }, message || '');
   const user = h('input', { type: 'text', id: 'u', autocomplete: 'username', required: true });
   const pass = h('input', { type: 'password', id: 'p', autocomplete: 'current-password', required: true });
   $app.replaceChildren(h('div', { class: 'login' }, h('form', {
@@ -111,33 +120,72 @@ function showLogin() {
 }
 
 // ---- Marco -----------------------------------------------------------------------------------
+// Cada vista dice quién la ve: g = administrador general sin empresa elegida, a = administrador de empresa,
+// o = operador. El administrador general que eligió una empresa ve las vistas de empresa además de las suyas.
 const VIEWS = [
-  ['wall', 'Pantallas', viewWall],
-  ['profiles', 'Perfiles', viewProfiles],
-  ['library', 'Biblioteca', viewLibrary],
-  ['sends', 'Envíos', viewSends],
-  ['enroll', 'Alta de equipos', viewEnroll],
-  ['account', 'Cuenta', viewAccount],
+  ['companies', 'Empresas', viewCompanies, 'g'],
+  ['billing', 'Facturación', viewBilling, 'g'],
+  ['settings', 'Configuración', viewSettings, 'g'],
+  ['wall', 'Pantallas', viewWall, 'ao'],
+  ['profiles', 'Perfiles', viewProfiles, 'a'],
+  ['library', 'Biblioteca', viewLibrary, 'a'],
+  ['sends', 'Envíos', viewSends, 'ao'],
+  ['enroll', 'Alta de equipos', viewEnroll, 'a'],
+  ['users', 'Usuarios', viewUsers, 'a'],
+  ['account', 'Cuenta', viewAccount, 'gao'],
 ];
 let current = 'wall';
 let $main;
+let me = null;
 
-function start() {
-  const nav = VIEWS.map(([id, label]) => h('button', { 'data-v': id, onclick: () => go(id) }, label));
+const isSuper = () => me?.role === 'superadmin';
+const isOperator = () => me?.role === 'operator';
+const canAdmin = () => isSuper() || me?.role === 'admin';
+function allowed(who) {
+  if (isSuper()) return who.includes('g') || (!!me.company && (who.includes('a') || who.includes('o')));
+  return who.includes(isOperator() ? 'o' : 'a');
+}
+
+/** Nombre de la empresa con la frase fija más chica, como en la pantalla del TV Box. */
+function brandBlock(name, phrase) {
+  return h('div', { class: 'brand' }, h('img', { src: 'icon.svg', alt: '' }),
+    h('span', { class: 'brand-text' }, h('span', { class: 'brand-name' }, name), phrase ? h('span', { class: 'brand-phrase' }, phrase) : null));
+}
+
+async function start() {
+  me = await api('GET', '/api/me');
+  const views = VIEWS.filter(([, , , who]) => allowed(who));
+  const globalViews = views.filter(([, , , who]) => who.includes('g') && who !== 'gao');
+  const companyViews = views.filter(([, , , who]) => !who.includes('g'));
+  const navButton = ([id, label]) => h('button', { 'data-v': id, onclick: () => go(id) }, label);
   $main = h('main', { id: 'main' });
+  const brand = me.company && !isSuper() ? brandBlock(me.company.name, me.brandPhrase) : brandBlock(me.product);
   $app.replaceChildren(h('div', { class: 'shell' },
     h('nav', { class: 'rail', 'aria-label': 'Secciones' },
-      h('div', { class: 'brand' }, h('img', { src: 'icon.svg', alt: '' }), 'WiFly MDM'),
-      nav,
-      h('div', { class: 'bottom' }, h('button', {
-        onclick: guard(async () => { await api('POST', '/api/logout', {}); showLogin(); }),
-      }, 'Salir'))),
+      brand,
+      globalViews.map(navButton),
+      isSuper() && me.company ? h('div', { class: 'rail-company' },
+        h('span', { class: 'rail-label' }, 'Administrando'),
+        h('strong', {}, me.company.name),
+        h('button', { class: 'rail-back', onclick: guard(() => setContext(null)) }, 'Volver a empresas')) : null,
+      companyViews.map(navButton),
+      h('div', { class: 'bottom' },
+        navButton(['account', 'Cuenta']),
+        h('button', { onclick: guard(async () => { await api('POST', '/api/logout', {}); showLogin(); }) }, 'Salir'))),
     $main));
-  go(location.hash.slice(1) || 'wall');
+  const first = isSuper() && !me.company ? 'companies' : 'wall';
+  go(location.hash.slice(1) || first);
+}
+
+async function setContext(companyId) {
+  await api('POST', '/api/context', { companyId });
+  location.hash = companyId ? 'wall' : 'companies';
+  await start();
 }
 
 function go(id) {
-  if (!VIEWS.some(([v]) => v === id)) id = 'wall';
+  const view = VIEWS.find(([v, , , who]) => v === id && allowed(who)) || VIEWS.find(([v, , , who]) => allowed(who) && v !== 'account');
+  id = view[0];
   current = id;
   stopTimer();
   stopTimer = () => {};
@@ -147,7 +195,7 @@ function go(id) {
   });
   document.querySelector('.actionbar')?.remove();
   $main.textContent = '';
-  guard(VIEWS.find(([v]) => v === id)[2])();
+  guard(view[2])();
 }
 
 const fill = (...kids) => $main.replaceChildren(...kids.flat(Infinity).filter(Boolean));
@@ -160,7 +208,7 @@ let devices = [];
 let profilesCache = [];
 
 async function viewWall() {
-  profilesCache = await api('GET', '/api/profiles');
+  profilesCache = canAdmin() ? await api('GET', '/api/profiles') : [];
   const wallBox = h('div');
   const count = h('span', { class: 'count' });
   const groupSel = h('select', { 'aria-label': 'Grupo', onchange: (e) => { filter.group = e.target.value; paint(); } });
@@ -216,7 +264,9 @@ async function viewWall() {
     const sel = selected.has(d.id);
     const alerts = alertsOf(d);
     let glass;
-    if (d.blocked) {
+    if (d.suspended) {
+      glass = h('span', { class: 'glass blocked' }, h('strong', {}, 'Servicio suspendido'), h('span', {}, 'Comuníquese con su proveedor.'));
+    } else if (d.blocked) {
       glass = h('span', { class: 'glass blocked' }, h('strong', {}, d.blockTitle || 'Bloqueado'), d.blockMessage ? h('span', {}, d.blockMessage) : null);
     } else if (!d.online) {
       glass = h('span', { class: 'glass off' }, 'Sin señal');
@@ -224,7 +274,7 @@ async function viewWall() {
       glass = h('span', { class: 'glass' }, h('span', { class: 'top' }, h('span', {}, d.title || 'WiFly'), h('span', { class: 'tick' }, sel ? '✓' : '')), h('span', { class: 'state' }, d.state.kiosk === false ? 'Fuera del kiosko' : `${d.effectiveApps.length} apps`));
       if (d.wallpaperSha) glass.style.backgroundImage = bgImage(d.wallpaperSha);
     }
-    if (d.blocked || !d.online) {
+    if (d.blocked || d.suspended || !d.online) {
       if (sel) glass.prepend(h('span', { class: 'tick' }, '✓'));
     }
     return h('div', { class: 'unit' },
@@ -250,8 +300,8 @@ async function viewWall() {
       h('button', { class: 'primary', onclick: () => sendMessageDialog(ids, load) }, 'Enviar mensaje'),
       h('button', { class: 'stop', onclick: () => lockDialog(ids, load) }, 'Bloquear'),
       h('button', { onclick: guard(() => bulk(ids, 'unlock', {}, 'Desbloqueo enviado', load)) }, 'Desbloquear'),
-      h('button', { onclick: () => assignDialog(ids, load) }, 'Cambiar perfil'),
-      h('button', { onclick: () => confirmDialog('Reiniciar equipos', `Se van a reiniciar ${plural(ids.length, 'equipo', 'equipos')}. Quien esté mirando algo se va a cortar.`, 'Reiniciar', true, () => bulk(ids, 'reboot', {}, 'Reinicio enviado', load)) }, 'Reiniciar'),
+      canAdmin() ? h('button', { onclick: () => assignDialog(ids, load) }, 'Cambiar perfil') : null,
+      canAdmin() ? h('button', { onclick: () => confirmDialog('Reiniciar equipos', `Se van a reiniciar ${plural(ids.length, 'equipo', 'equipos')}. Quien esté mirando algo se va a cortar.`, 'Reiniciar', true, () => bulk(ids, 'reboot', {}, 'Reinicio enviado', load)) }, 'Reiniciar') : null,
       h('span', { class: 'spacer' }),
       h('button', { onclick: () => { selected.clear(); paint(); } }, 'Quitar selección')));
   }
@@ -272,7 +322,7 @@ async function viewWall() {
 function alertsOf(d) {
   const s = d.state;
   const a = [];
-  if (s.mode === 'compat') a.push('Modo compatible: protección intermedia, instala apps con confirmación en pantalla');
+  if (s.mode === 'compat') a.push('Modo compatible: protección intermedia');
   else if (s.deviceOwner === false) a.push('No es Device Owner: el kiosko no está protegido');
   else if (d.online && s.kiosk === true && s.lockTask === false) a.push('El kiosko no está activo');
   if (s.defaultCredentials && !d.blocked) a.push('Usa la clave de salida por defecto');
@@ -339,7 +389,8 @@ const COMMAND = { message: 'Mensaje', reboot: 'Reinicio', sync: 'Sincronización
 const statusPill = (s) => h('span', { class: `pill ${STATUS[s]?.[1] || ''}` }, STATUS[s]?.[0] || s);
 
 async function openDevice(id, onChange) {
-  const [d, files, profiles] = await Promise.all([api('GET', `/api/devices/${id}`), api('GET', '/api/files'), api('GET', '/api/profiles')]);
+  const admin = canAdmin();
+  const [d, files, profiles] = await Promise.all([api('GET', `/api/devices/${id}`), admin ? api('GET', '/api/files') : [], admin ? api('GET', '/api/profiles') : []]);
   const s = d.state;
   const refresh = async () => { dlg.close(); await onChange?.(); await openDevice(id, onChange); };
   const name = h('input', { type: 'text', id: 'dn', value: d.name, maxlength: 80 });
@@ -367,15 +418,15 @@ async function openDevice(id, onChange) {
     return h('tr', {},
       h('td', {}, h('strong', {}, a.label), h('br'), h('small', {}, a.package), a.version ? h('small', {}, ` · ${a.version}`) : null),
       h('td', {}, h('span', { class: `pill ${shown ? 'ok' : ''}` }, shown ? 'Visible' : 'Bloqueada')),
-      h('td', {}, h('div', { class: 'row-actions' },
+      admin ? h('td', {}, h('div', { class: 'row-actions' },
         h('button', { onclick: () => setOverride(a.package, !shown) }, shown ? 'Bloquear' : 'Mostrar'),
-        a.system ? null : h('button', { class: 'danger', onclick: () => confirmDialog('Desinstalar app', `¿Desinstalar ${a.label} de ${d.name}?`, 'Desinstalar', true, act('uninstall', { package: a.package }, 'Desinstalación enviada')) }, 'Desinstalar'))));
+        a.system ? null : h('button', { class: 'danger', onclick: () => confirmDialog('Desinstalar app', `¿Desinstalar ${a.label} de ${d.name}?`, 'Desinstalar', true, act('uninstall', { package: a.package }, 'Desinstalación enviada')) }, 'Desinstalar'))) : null);
   });
 
   const dlg = h('dialog', { class: 'drawer' },
     h('div', { class: 'drawer-head' }, h('h2', {}, d.name), h('button', { onclick: () => dlg.close() }, 'Cerrar')),
     h('p', {}, h('span', { class: `pill ${d.online ? 'ok' : ''}` }, d.online ? 'En línea' : `Sin señal, visto ${ago(d.lastSeen)}`), ' ',
-      d.blocked ? h('span', { class: 'pill bad' }, 'Bloqueado') : null, ' ',
+      d.suspended ? h('span', { class: 'pill bad' }, 'Servicio suspendido') : d.blocked ? h('span', { class: 'pill bad' }, 'Bloqueado') : null, ' ',
       d.synced ? h('span', { class: 'pill ok' }, 'Perfil aplicado') : h('span', { class: 'pill warn' }, 'Perfil pendiente')),
     alerts.map((a) => h('div', { class: 'note' }, a)),
     h('dl', { class: 'facts' },
@@ -387,14 +438,15 @@ async function openDevice(id, onChange) {
     h('div', { class: 'wrap-actions' },
       h('button', { class: 'primary', onclick: () => sendMessageDialog([id], refresh) }, 'Enviar mensaje'),
       d.blocked ? h('button', { onclick: act('unlock', {}, 'Desbloqueo enviado') }, 'Desbloquear') : h('button', { class: 'danger', onclick: () => lockDialog([id], refresh) }, 'Bloquear'),
+      admin ? [
       h('button', { onclick: act('sync', {}, 'Sincronización enviada') }, 'Sincronizar'),
       h('button', { onclick: () => confirmDialog('Reiniciar equipo', `¿Reiniciar ${d.name}?`, 'Reiniciar', true, act('reboot', {}, 'Reinicio enviado')) }, 'Reiniciar'),
       s.kiosk === false
         ? h('button', { onclick: act('enterKiosk', {}, 'Activación enviada') }, 'Activar kiosko')
         : h('button', { onclick: () => confirmDialog('Salir del kiosko', `${d.name} va a volver al launcher original y queda sin protección hasta reactivar el kiosko.`, 'Salir del kiosko', true, act('exitKiosk', {}, 'Salida enviada')) }, 'Salir del kiosko'),
-      h('button', { class: 'danger', onclick: () => confirmDialog('Dar de baja', `WiFly deja de administrar ${d.name} y el equipo vuelve a su estado original. Para administrarlo otra vez hay que reinstalarlo con el script.`, 'Dar de baja', true, act('decommission', {}, 'Baja enviada')) }, 'Dar de baja')),
+      h('button', { class: 'danger', onclick: () => confirmDialog('Dar de baja', `WiFly deja de administrar ${d.name} y el equipo vuelve a su estado original. Para administrarlo otra vez hay que reinstalarlo con el script.`, 'Dar de baja', true, act('decommission', {}, 'Baja enviada')) }, 'Dar de baja')] : null),
 
-    h('h3', {}, 'Datos'),
+    admin ? [h('h3', {}, 'Datos'),
     h('label', { for: 'dn' }, 'Nombre'), name,
     h('label', { for: 'dg' }, 'Grupo'), group,
     h('label', { for: 'dp' }, 'Perfil'), profile,
@@ -403,17 +455,17 @@ async function openDevice(id, onChange) {
       await api('PATCH', `/api/devices/${id}`, { name: name.value, group: group.value, profileId: Number(profile.value), notes: notes.value });
       toast('Cambios guardados');
       await refresh();
-    }) }, 'Guardar cambios')),
+    }) }, 'Guardar cambios'))] : null,
 
     h('h3', {}, 'Aplicaciones en este equipo'),
     appRows.length
       ? h('div', { class: 'table-wrap' }, h('table', {}, h('tbody', {}, appRows)))
       : h('p', { class: 'hint' }, 'El equipo todavía no informó sus aplicaciones.'),
-    h('div', { class: 'inline-add' }, apk, h('button', { onclick: guard(async () => {
+    admin ? h('div', { class: 'inline-add' }, apk, h('button', { onclick: guard(async () => {
       if (!apk.value) throw new Error('Elegí un APK de la lista');
       await bulk([id], 'install', { sha: apk.value }, 'Instalación enviada');
       await refresh();
-    }) }, 'Instalar')),
+    }) }, 'Instalar')) : null,
 
     h('h3', {}, 'Últimos envíos'),
     d.commands.length ? h('div', { class: 'table-wrap' }, h('table', {}, h('tbody', {}, d.commands.map((c) => h('tr', {},
@@ -421,11 +473,11 @@ async function openDevice(id, onChange) {
       h('td', {}, statusPill(c.status), c.detail ? h('br') : null, c.detail ? h('small', {}, c.detail) : null),
       h('td', {}, dateTime(c.createdAt))))))) : h('p', { class: 'hint' }, 'Sin envíos todavía.'),
 
-    h('div', { class: 'save-bar' }, h('button', { class: 'danger', onclick: () => confirmDialog('Eliminar del panel', `Se borra ${d.name} del panel. El equipo conserva su último perfil, sigue en kiosko y deja de recibir órdenes. Si querés liberarlo, usá Dar de baja.`, 'Eliminar del panel', true, guard(async () => {
+    admin ? h('div', { class: 'save-bar' }, h('button', { class: 'danger', onclick: () => confirmDialog('Eliminar del panel', `Se borra ${d.name} del panel. El equipo conserva su último perfil, sigue en kiosko y deja de recibir órdenes. Si querés liberarlo, usá Dar de baja.`, 'Eliminar del panel', true, guard(async () => {
       await api('DELETE', `/api/devices/${id}`);
       dlg.close();
       await onChange?.();
-    })) }, 'Eliminar del panel')));
+    })) }, 'Eliminar del panel')) : null);
   dlg.addEventListener('close', () => dlg.remove());
   document.body.append(dlg);
   dlg.showModal();
@@ -472,7 +524,8 @@ function profileForm(p, files, known) {
   for (const a of p.apps) if (!catalog.has(a.package)) catalog.set(a.package, { package: a.package, label: a.label || a.package });
 
   const name = h('input', { type: 'text', id: 'f-name', value: p.name, maxlength: 60 });
-  const title = h('input', { type: 'text', id: 'f-title', value: p.title, maxlength: 60, oninput: paintPreview });
+  const companyName = me.company?.name || 'WiFly';
+  const title = h('input', { type: 'text', id: 'f-title', value: p.title, maxlength: 60, placeholder: companyName, oninput: paintPreview });
   const clock = h('input', { type: 'checkbox', checked: p.showClock !== false, onchange: paintPreview });
   const wifi = h('input', { type: 'checkbox', checked: p.allowWifi !== false, onchange: paintPreview });
   const adb = h('input', { type: 'checkbox', checked: !!p.adbAllowed });
@@ -489,7 +542,7 @@ function profileForm(p, files, known) {
     const names = [...apps.values()].map((a) => a.label || catalog.get(a.package)?.label || a.package);
     if (wifi.checked) names.push('WiFi');
     glass.replaceChildren(
-      h('div', { class: 'bar' }, h('span', {}, title.value || 'WiFly'), clock.checked ? h('span', {}, '21:30') : null),
+      h('div', { class: 'bar' }, h('span', { class: 'tv-brand' }, h('span', {}, title.value || companyName), me.brandPhrase ? h('small', {}, me.brandPhrase) : null), clock.checked ? h('span', {}, '21:30') : null),
       h('div', { class: 'tiles' }, names.slice(0, 8).map((n, i) => h('div', { class: `tile${i === 0 ? ' first' : ''}` }, n))));
   }
 
@@ -551,6 +604,7 @@ function profileForm(p, files, known) {
       h('p', { class: 'hint' }, 'JPG, PNG o WebP, idealmente de 1920 × 1080.'),
       h('label', { for: 'f-name' }, 'Nombre del perfil'), name,
       h('label', { for: 'f-title' }, 'Título en pantalla'), title,
+      h('p', { class: 'hint' }, `Vacío: se muestra el nombre de la empresa. La frase "${me.brandPhrase || 'definida por el administrador general'}" se agrega debajo, más chica.`),
       h('label', { class: 'check' }, clock, 'Mostrar el reloj'),
       h('label', { class: 'check' }, wifi, 'Mostrar el acceso a WiFi')),
     h('div', { class: 'sheet' },
@@ -617,7 +671,7 @@ async function viewLibrary() {
 
 // ---- Envíos ----------------------------------------------------------------------------------------
 async function viewSends() {
-  const [sends, audit] = await Promise.all([api('GET', '/api/sends'), api('GET', '/api/audit')]);
+  const [sends, audit] = await Promise.all([api('GET', '/api/sends'), canAdmin() ? api('GET', '/api/audit') : null]);
   fill(
     header('Envíos'),
     h('div', { class: 'sheet' }, h('h2', {}, 'Mensajes y órdenes'),
@@ -626,8 +680,7 @@ async function viewSends() {
         s.payload.body ? h('p', {}, s.payload.title ? `${s.payload.title}: ` : '', s.payload.body) : null,
         h('div', { class: 'table-wrap' }, h('table', {}, h('tbody', {}, s.items.map((i) => h('tr', {}, h('td', {}, i.device), h('td', {}, statusPill(i.status)), h('td', {}, i.detail))))))))
         : h('p', { class: 'hint' }, 'Los mensajes y órdenes que envíes aparecen acá con su estado por equipo.')),
-    h('div', { class: 'sheet' }, h('h2', {}, 'Actividad del panel'),
-      h('div', { class: 'table-wrap' }, h('table', {}, h('tbody', {}, audit.map((a) => h('tr', {}, h('td', {}, dateTime(a.ts)), h('td', {}, a.actor), h('td', {}, a.action), h('td', {}, a.detail))))))));
+    audit ? h('div', { class: 'sheet' }, h('h2', {}, 'Actividad del panel'), auditTable(audit)) : null);
 }
 
 // ---- Alta de equipos ---------------------------------------------------------------------------------
@@ -668,12 +721,11 @@ async function viewEnroll() {
 
 // ---- Cuenta -----------------------------------------------------------------------------------------
 async function viewAccount() {
-  const me = await api('GET', '/api/me');
   const cur = h('input', { type: 'password', id: 'c-c', autocomplete: 'current-password' });
   const nxt = h('input', { type: 'password', id: 'c-n', autocomplete: 'new-password' });
   fill(
     header('Cuenta'),
-    h('div', { class: 'sheet' }, h('p', {}, 'Entraste como ', h('strong', {}, me.username), '.'),
+    h('div', { class: 'sheet' }, h('p', {}, 'Entraste como ', h('strong', {}, me.username), `, ${ROLE[me.role]}`, me.company && !isSuper() ? ` de ${me.company.name}` : '', '.'),
       h('h2', {}, 'Cambiar clave del panel'),
       h('label', { for: 'c-c' }, 'Clave actual'), cur,
       h('label', { for: 'c-n' }, 'Clave nueva (10 caracteres o más)'), nxt,
@@ -686,4 +738,180 @@ async function viewAccount() {
 }
 
 // ---- Arranque --------------------------------------------------------------------------------------
-api('GET', '/api/me').then(start).catch(() => {});
+start().catch(() => {});
+
+// ---- Vistas compartidas -------------------------------------------------------------------------
+const ROLE = { superadmin: 'administrador general', admin: 'administrador', operator: 'operador' };
+
+function auditTable(rows) {
+  if (!rows.length) return h('p', { class: 'hint' }, 'Sin actividad todavía.');
+  return h('div', { class: 'table-wrap' }, h('table', {}, h('tbody', {}, rows.map((a) => h('tr', {},
+    h('td', {}, dateTime(a.ts)), a.company !== undefined ? h('td', {}, a.company || 'General') : null,
+    h('td', {}, a.actor), h('td', {}, a.action), h('td', {}, a.detail))))));
+}
+
+// ---- Usuarios --------------------------------------------------------------------------------------
+/** Sin empresa elegida (administrador general): los administradores generales. Con empresa: sus usuarios. */
+function usersSheet(users, roles, title, intro) {
+  const user = h('input', { type: 'text', id: 'nu-u', maxlength: 40, autocomplete: 'off' });
+  const pass = h('input', { type: 'password', id: 'nu-p', autocomplete: 'new-password' });
+  const role = h('select', { id: 'nu-r' }, roles.map(([v, t]) => h('option', { value: v }, t)));
+  const reset = (u) => {
+    const p = h('input', { type: 'password', id: 'rp', autocomplete: 'new-password' });
+    const d = dialog(`Nueva clave para ${u.username}`, h('div', {}, h('label', { for: 'rp' }, 'Clave nueva (10 caracteres o más)'), p,
+      h('p', { class: 'hint' }, 'Sus sesiones abiertas se cierran. Pasale la clave por un medio seguro.')), [
+      h('button', { onclick: () => d.close() }, 'Cancelar'),
+      h('button', { class: 'primary', onclick: guard(async () => { await api('POST', `/api/users/${u.id}/password`, { password: p.value }); d.close(); toast('Clave cambiada'); }) }, 'Cambiar clave'),
+    ]);
+    p.focus();
+  };
+  const manageable = (u) => u.username !== me.username && (isSuper() || u.role === 'operator');
+  return [
+    h('div', { class: 'sheet' }, h('h2', {}, title), intro ? h('p', {}, intro) : null,
+      h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, ['Usuario', 'Rol', ''].map((t) => h('th', {}, t)))),
+        h('tbody', {}, users.map((u) => h('tr', {}, h('td', {}, u.username, u.username === me.username ? ' (vos)' : ''), h('td', {}, u.roleLabel),
+          h('td', {}, manageable(u) ? h('div', { class: 'row-actions' },
+            h('button', { onclick: () => reset(u) }, 'Cambiar clave'),
+            h('button', { class: 'danger', onclick: () => confirmDialog('Eliminar usuario', `${u.username} ya no va a poder entrar al panel.`, 'Eliminar usuario', true, guard(async () => { await api('DELETE', `/api/users/${u.id}`); go(current); })) }, 'Eliminar')) : null))))))),
+    h('div', { class: 'sheet' }, h('h2', {}, 'Crear usuario'),
+      h('label', { for: 'nu-u' }, 'Usuario'), user,
+      h('label', { for: 'nu-p' }, 'Clave (10 caracteres o más)'), pass,
+      roles.length > 1 ? [h('label', { for: 'nu-r' }, 'Rol'), role] : null,
+      roles.some(([v]) => v === 'operator') ? h('p', { class: 'hint' }, 'El operador solo puede enviar mensajes, bloquear y desbloquear equipos.') : null,
+      h('div', { class: 'save-bar' }, h('button', { class: 'primary', onclick: guard(async () => {
+        await api('POST', '/api/users', { username: user.value, password: pass.value, role: role.value });
+        toast(`Usuario ${user.value} creado`);
+        go(current);
+      }) }, 'Crear usuario'))),
+  ];
+}
+
+async function viewUsers() {
+  const users = await api('GET', '/api/users');
+  const roles = isSuper() ? [['admin', 'Administrador de la empresa'], ['operator', 'Operador']] : [['operator', 'Operador']];
+  fill(header('Usuarios'), usersSheet(users, roles, `Usuarios de ${me.company.name}`, ''));
+}
+
+// ---- Empresas (administrador general) ------------------------------------------------------------
+const dayDate = (ts) => new Date(ts).toLocaleDateString('es-AR', { dateStyle: 'medium' });
+function companyState(c) {
+  if (c.status === 'active') return h('span', { class: 'pill ok' }, 'Activa');
+  if (c.devicesSuspended) return h('span', { class: 'pill bad' }, 'Suspendida, TV Box bloqueados');
+  return [h('span', { class: 'pill warn' }, 'Panel suspendido'), h('br'), h('small', {}, `TV Box se bloquean el ${dayDate(c.devicesSuspendAt)}`)];
+}
+
+async function viewCompanies() {
+  const [companies, settings] = await Promise.all([api('GET', '/api/companies'), api('GET', '/api/settings')]);
+  const total = companies.reduce((n, c) => n + c.monthDevices, 0);
+  const rows = companies.map((c) => h('tr', {},
+    h('td', {}, h('strong', {}, c.name), c.notes ? [h('br'), h('small', {}, c.notes)] : null),
+    h('td', {}, companyState(c)),
+    h('td', { class: 'num' }, c.devices), h('td', { class: 'num' }, c.online), h('td', { class: 'num' }, c.monthDevices),
+    h('td', {}, c.admins.join(', ') || h('span', { class: 'hint' }, 'Sin administrador')),
+    h('td', {}, h('div', { class: 'row-actions' },
+      h('button', { class: 'primary', onclick: guard(() => setContext(c.id)) }, 'Administrar'),
+      c.status === 'active'
+        ? h('button', { class: 'danger', onclick: () => confirmDialog(`Suspender ${c.name}`, `El panel de ${c.name} se corta ahora. Si no se registra el pago en ${settings.graceDays} días, sus TV Box muestran "Servicio suspendido".`, 'Suspender', true, guard(async () => { await api('POST', `/api/companies/${c.id}/suspend`, {}); toast(`${c.name} suspendida`); go('companies'); })) }, 'Suspender')
+        : h('button', { onclick: guard(async () => { await api('POST', `/api/companies/${c.id}/activate`, {}); toast(`Pago registrado: ${c.name} reactivada`); go('companies'); }) }, 'Marcar pagada'),
+      h('button', { onclick: () => editCompany(c) }, 'Editar'),
+      c.devices === 0 ? h('button', { class: 'plain', onclick: () => confirmDialog(`Eliminar ${c.name}`, 'Se borran la empresa, sus usuarios, perfiles y archivos. No se puede deshacer.', 'Eliminar empresa', true, guard(async () => { await api('DELETE', `/api/companies/${c.id}`); go('companies'); })) }, 'Eliminar') : null))));
+  fill(
+    header('Empresas', h('span', { class: 'count' }, companies.length ? `${plural(companies.length, 'empresa', 'empresas')}, ${plural(total, 'equipo facturable', 'equipos facturables')} este mes` : ''),
+      h('span', { class: 'spacer' }), h('button', { class: 'primary', onclick: newCompany }, 'Crear empresa')),
+    companies.length
+      ? h('div', { class: 'sheet' }, h('div', { class: 'table-wrap' }, h('table', { class: 'companies' },
+        h('thead', {}, h('tr', {}, ['Empresa', 'Estado', 'Equipos', 'En línea', 'Facturables este mes', 'Administradores', ''].map((t, i) => h('th', { class: i >= 2 && i <= 4 ? 'num' : null }, t)))),
+        h('tbody', {}, rows))))
+      : h('div', { class: 'empty' }, h('h2', {}, 'Todavía no hay empresas'), h('p', {}, 'Creá la primera empresa con su administrador. Él va a poder cargar sus equipos, perfiles y apps.'),
+        h('button', { class: 'primary', onclick: newCompany }, 'Crear empresa')));
+}
+
+function newCompany() {
+  const name = h('input', { type: 'text', id: 'nc-n', maxlength: 60 });
+  const user = h('input', { type: 'text', id: 'nc-u', maxlength: 40, autocomplete: 'off' });
+  const pass = h('input', { type: 'password', id: 'nc-p', autocomplete: 'new-password' });
+  const d = dialog('Crear empresa', h('div', {},
+    h('label', { for: 'nc-n' }, 'Nombre de la empresa'), name,
+    h('h3', {}, 'Administrador de la empresa'),
+    h('label', { for: 'nc-u' }, 'Usuario'), user,
+    h('label', { for: 'nc-p' }, 'Clave (10 caracteres o más)'), pass,
+    h('p', { class: 'hint' }, 'Podés dejarlo vacío y crearlo después desde Usuarios, administrando la empresa.')), [
+    h('button', { onclick: () => d.close() }, 'Cancelar'),
+    h('button', { class: 'primary', onclick: guard(async () => {
+      await api('POST', '/api/companies', { name: name.value, adminUser: user.value || undefined, adminPassword: pass.value });
+      d.close();
+      toast(`${name.value} creada`);
+      go('companies');
+    }) }, 'Crear empresa'),
+  ]);
+  name.focus();
+}
+
+function editCompany(c) {
+  const name = h('input', { type: 'text', id: 'ec-n', maxlength: 60, value: c.name });
+  const notes = h('textarea', { id: 'ec-o', maxlength: 500, value: c.notes });
+  const d = dialog(`Editar ${c.name}`, h('div', {},
+    h('label', { for: 'ec-n' }, 'Nombre'), name,
+    h('p', { class: 'hint' }, 'Es el nombre que ven la empresa en su panel y sus clientes en los TV Box.'),
+    h('label', { for: 'ec-o' }, 'Notas internas'), notes), [
+    h('button', { onclick: () => d.close() }, 'Cancelar'),
+    h('button', { class: 'primary', onclick: guard(async () => {
+      await api('PATCH', `/api/companies/${c.id}`, { name: name.value, notes: notes.value });
+      d.close();
+      go('companies');
+    }) }, 'Guardar cambios'),
+  ]);
+}
+
+// ---- Facturación ----------------------------------------------------------------------------------
+let billingMonth = null;
+const monthLabel = (m) => {
+  const [y, mo] = m.split('-').map(Number);
+  const t = new Date(y, mo - 1, 1).toLocaleDateString('es-AR', { month: 'long', year: 'numeric' });
+  return t.charAt(0).toUpperCase() + t.slice(1);
+};
+
+async function viewBilling() {
+  const r = await api('GET', `/api/billing${billingMonth ? `?month=${billingMonth}` : ''}`);
+  billingMonth = r.month;
+  const sel = h('select', { 'aria-label': 'Mes', onchange: (e) => { billingMonth = e.target.value; go('billing'); } },
+    r.months.map((m) => h('option', { value: m, selected: m === r.month }, monthLabel(m))));
+  const statusText = { active: 'Activa', suspended: 'Suspendida', deleted: 'Eliminada' };
+  fill(
+    header('Facturación', sel, r.closed ? h('span', { class: 'pill ok' }, 'Mes cerrado') : h('span', { class: 'pill warn' }, 'Mes en curso'),
+      h('span', { class: 'spacer' }), h('a', { class: 'button', href: `/api/billing.csv?month=${r.month}`, download: '' }, 'Exportar a Excel (CSV)')),
+    h('p', {}, 'Se factura todo equipo que estuvo registrado al menos un día del mes, aunque después se haya dado de baja. ',
+      r.closed ? 'Este mes ya cerró y su número no cambia.' : 'Este número puede subir hasta que termine el mes.'),
+    h('div', { class: 'sheet' }, h('div', { class: 'table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, h('th', {}, 'Empresa'), h('th', {}, 'Estado'), h('th', { class: 'num' }, 'Equipos facturables'), h('th', {}, ''))),
+      h('tbody', {}, r.rows.map((x) => h('tr', {}, h('td', {}, x.name), h('td', {}, statusText[x.status] || x.status), h('td', { class: 'num' }, x.devices),
+        h('td', {}, x.devices ? h('a', { href: `/api/billing/${x.companyId}/devices.csv?month=${r.month}`, download: '' }, 'Detalle por equipo') : null))),
+      h('tr', { class: 'total' }, h('td', {}, 'Total'), h('td', {}), h('td', { class: 'num' }, r.total), h('td', {})))))));
+}
+
+// ---- Configuración general ------------------------------------------------------------------------
+async function viewSettings() {
+  const [settings, users, audit] = await Promise.all([api('GET', '/api/settings'), api('GET', '/api/users'), api('GET', '/api/audit')]);
+  const phrase = h('input', { type: 'text', id: 's-ph', maxlength: 40, value: settings.brandPhrase, placeholder: 'por DBI', oninput: () => paint() });
+  const grace = h('input', { type: 'number', id: 's-gr', min: 0, max: 365, value: settings.graceDays });
+  const sample = h('div', { class: 'brand-sample' });
+  const paint = () => sample.replaceChildren(h('span', { class: 'brand-name' }, 'Hotel Sur'), phrase.value ? h('span', { class: 'brand-phrase' }, phrase.value) : null);
+  paint();
+  fill(
+    header('Configuración'),
+    h('div', { class: 'sheet' }, h('h2', {}, 'Marca'),
+      h('p', {}, `El sistema se llama ${me.product}. Cada empresa se muestra con su nombre y esta frase debajo, más chica, en su panel y en sus TV Box.`),
+      h('label', { for: 's-ph' }, 'Frase fija'), phrase,
+      h('p', { class: 'hint' }, 'Así se ve:'), sample,
+      h('h2', { class: 'spaced' }, 'Suspensión por falta de pago'),
+      h('label', { for: 's-gr' }, 'Días de gracia antes de suspender los TV Box'), grace,
+      h('p', { class: 'hint' }, 'Al suspender una empresa, su panel se corta en el momento. Si en estos días no se registra el pago, sus TV Box muestran "Servicio suspendido, comuníquese con su proveedor".'),
+      h('div', { class: 'save-bar' }, h('button', { class: 'primary', onclick: guard(async () => {
+        await api('PUT', '/api/settings', { brandPhrase: phrase.value, graceDays: Number(grace.value) });
+        me.brandPhrase = phrase.value.trim();
+        toast('Configuración guardada. Los TV Box la reciben en unos segundos.');
+      }) }, 'Guardar configuración'))),
+    usersSheet(users, [['superadmin', 'Administrador general']], 'Administradores generales', 'Pueden ver y administrar todas las empresas.'),
+    h('div', { class: 'sheet' }, h('h2', {}, 'Actividad general'), auditTable(audit)));
+}

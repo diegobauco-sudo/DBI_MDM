@@ -89,6 +89,44 @@ Sin `--device`, usa el equipo conectado por USB. Para el primer equipo agregá `
 
 `enroll.sh` también funciona sin servidor: omití `--server` y `--token`, y elegí las apps en el menú de administrador del TV Box.
 
+## Multiempresa
+
+Desde la versión 2.0, un mismo servidor administra varias empresas por separado.
+
+| Rol | Qué puede hacer |
+|---|---|
+| **Administrador general** | Crea, edita, suspende y elimina empresas; ve la facturación; define la frase de marca y los días de gracia; administra cualquier empresa eligiéndola con **Administrar**. |
+| **Administrador de empresa** | Todo lo de su empresa: equipos, perfiles, biblioteca de apps, tokens de alta y operadores. No ve nada de otras empresas. |
+| **Operador** | Solo envía mensajes, bloquea y desbloquea equipos de su empresa. |
+
+- **Facturación:** se factura todo equipo registrado al menos un día del mes, aunque después se dé de baja. El primer día de cada mes, el anterior se cierra y su número ya no cambia. Se exporta a CSV para Excel, con detalle por equipo.
+- **Suspensión:** al suspender una empresa, su panel se corta en el momento. Si en los días de gracia no se marca como pagada, sus TV Box muestran "Servicio suspendido, comuníquese con su proveedor". Al marcarla pagada vuelve todo.
+- **Marca:** cada empresa se muestra con su nombre y la frase fija (por ejemplo "por DBI") debajo, más chica, en su panel y en sus TV Box. En el TV Box se ve desde WiFly Launcher 1.3.0.
+
+### Actualizar un servidor 1.x a multiempresa
+
+1. **Respaldá los datos** antes de actualizar. Dentro del CT:
+
+   ```bash
+   cd /root/wifly/server
+   docker compose stop wifly
+   docker compose cp wifly:/data /root/respaldo-wifly-$(date +%F)
+   ```
+
+2. **Actualizá** con el zip nuevo:
+
+   ```bash
+   cd /root
+   unzip -o wiflymdm.zip
+   cd wifly/server
+   docker compose up -d --build
+   ```
+
+3. **Entrá con el usuario de siempre.** Ahora es administrador general. Todos los equipos, perfiles, archivos y tokens quedan en la empresa **Empresa principal**: cambiale el nombre en **Empresas, Editar**. Los equipos siguen conectados sin hacer nada.
+4. En **Configuración**, cargá la frase fija y los días de gracia.
+
+**Para volver a la versión anterior:** `docker compose down`, descomprimí el zip de la 1.2.1, copiá el respaldo de vuelta con `docker compose cp /root/respaldo-wifly-FECHA/. wifly:/data` y `docker compose up -d --build`.
+
 ## Apps divididas (.apks, .xapk, .apkm)
 
 Muchas apps de Play Store vienen divididas en varias partes. En **Biblioteca** se pueden subir así, igual que un APK común:
