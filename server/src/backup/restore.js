@@ -62,9 +62,21 @@ export function restoreCompany({ db, filesDir, extracted, companyId }) {
     db.prepare('DELETE FROM profiles WHERE company_id=?').run(companyId);
     db.prepare('DELETE FROM files WHERE company_id=?').run(companyId);
     db.prepare('DELETE FROM users WHERE company_id=?').run(companyId);
-    db.prepare('UPDATE companies SET name=?, notes=? WHERE id=?').run(
-      one('SELECT 1 FROM companies WHERE name=? AND id<>?', data.company.name, companyId) ? one('SELECT name FROM companies WHERE id=?', companyId).name : data.company.name,
-      data.company.notes || '', companyId);
+    db.prepare('DELETE FROM clients WHERE company_id=?').run(companyId);
+    const co = data.company;
+    // Un respaldo anterior a la v2.3 no trae datos fiscales: se conservan los actuales.
+    const cur = one('SELECT * FROM companies WHERE id=?', companyId);
+    const keep = (k) => (co[k] !== undefined ? co[k] : cur[k]);
+    db.prepare('UPDATE companies SET name=?, notes=?, legal_name=?, tax_address=?, tax_condition=?, tax_id=?, email=?, phone=? WHERE id=?').run(
+      one('SELECT 1 FROM companies WHERE name=? AND id<>?', co.name, companyId) ? cur.name : co.name,
+      co.notes || '', keep('legal_name'), keep('tax_address'), keep('tax_condition'), keep('tax_id'), keep('email'), keep('phone'), companyId);
+
+    const clientMap = new Map();
+    for (const c of data.clients || []) {
+      const id = db.prepare('INSERT INTO clients (company_id, ext_id, name, tax_id, address, phone, email, notes, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
+        .run(companyId, c.ext_id, c.name, c.tax_id, c.address, c.phone, c.email, c.notes, c.created_at, c.updated_at).lastInsertRowid;
+      clientMap.set(c.id, id);
+    }
 
     const profileMap = new Map();
     for (const p of data.profiles) {
@@ -73,18 +85,19 @@ export function restoreCompany({ db, filesDir, extracted, companyId }) {
     }
     for (const u of data.users) {
       if (one('SELECT 1 FROM users WHERE username=?', u.username)) { skipped.push(`usuario ${u.username} (el nombre ya lo usa otra cuenta)`); continue; }
-      db.prepare('INSERT INTO users (username, salt, hash, role, company_id, created_at) VALUES (?,?,?,?,?,?)').run(u.username, u.salt, u.hash, u.role, companyId, u.created_at);
+      db.prepare('INSERT INTO users (username, salt, hash, role, company_id, created_at, full_name, display_name, phone, email) VALUES (?,?,?,?,?,?,?,?,?,?)')
+        .run(u.username, u.salt, u.hash, u.role, companyId, u.created_at, u.full_name || '', u.display_name || '', u.phone || '', u.email || '');
     }
     for (const d of data.devices) {
       if (one('SELECT 1 FROM devices WHERE id=? OR install_id=? OR token_hash=?', d.id, d.install_id, d.token_hash)) { skipped.push(`equipo ${d.name} (hoy pertenece a otra empresa)`); continue; }
-      db.prepare(`INSERT INTO devices (id, company_id, token_hash, install_id, name, grp, notes, profile_id, blocked, block_title, block_message, app_overrides, state, public_ip, last_seen, created_at)
-                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(d.id, companyId, d.token_hash, d.install_id, d.name, d.grp, d.notes, profileMap.get(d.profile_id) ?? null,
-        d.blocked, d.block_title, d.block_message, d.app_overrides, d.state, d.public_ip, d.last_seen, d.created_at);
+      db.prepare(`INSERT INTO devices (id, company_id, token_hash, install_id, name, grp, notes, profile_id, blocked, block_title, block_message, app_overrides, state, public_ip, last_seen, created_at, client_id)
+                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(d.id, companyId, d.token_hash, d.install_id, d.name, d.grp, d.notes, profileMap.get(d.profile_id) ?? null,
+        d.blocked, d.block_title, d.block_message, d.app_overrides, d.state, d.public_ip, d.last_seen, d.created_at, clientMap.get(d.client_id) ?? null);
     }
     for (const t of data.enrollTokens) {
       if (one('SELECT 1 FROM enroll_tokens WHERE token=?', t.token)) { skipped.push(`token de alta ${t.label || t.token.slice(0, 4)}`); continue; }
-      db.prepare('INSERT INTO enroll_tokens (token, company_id, label, profile_id, grp, uses, max_uses, expires_at, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
-        .run(t.token, companyId, t.label, profileMap.get(t.profile_id) ?? null, t.grp, t.uses, t.max_uses, t.expires_at, t.created_at);
+      db.prepare('INSERT INTO enroll_tokens (token, company_id, label, profile_id, grp, uses, max_uses, expires_at, created_at, client_id) VALUES (?,?,?,?,?,?,?,?,?,?)')
+        .run(t.token, companyId, t.label, profileMap.get(t.profile_id) ?? null, t.grp, t.uses, t.max_uses, t.expires_at, t.created_at, clientMap.get(t.client_id) ?? null);
     }
     let missing = 0;
     for (const f of data.files) {
@@ -103,5 +116,5 @@ export function restoreCompany({ db, filesDir, extracted, companyId }) {
     db.exec('ROLLBACK');
     throw e;
   }
-  return { skipped, devices: data.devices.length, profiles: data.profiles.length, users: data.users.length, files: data.files.length };
+  return { skipped, clients: (data.clients || []).length, devices: data.devices.length, profiles: data.profiles.length, users: data.users.length, files: data.files.length };
 }

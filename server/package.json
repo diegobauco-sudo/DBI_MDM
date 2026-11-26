@@ -1,6 +1,6 @@
 {
   "name": "wifly-mdm",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Administrador de TV Boxes con WiFly Launcher",
   "private": true,
   "type": "module",
@@ -14,9 +14,10 @@
   "dependencies": {
     "@fontsource/atkinson-hyperlegible": "^5.3.0",
     "adbkit-apkreader": "^3.2.0",
-    "basic-ftp": "^5.3.1",
+    "basic-ftp": "^6.2.6",
     "express": "^4.22.3",
     "multer": "^2.5.0",
+    "nodemailer": "^10.6.1",
     "ssh2-sftp-client": "^11.0.0",
     "tar": "^7.5.23",
     "yauzl": "^2.10.0"

@@ -102,6 +102,22 @@ Desde la versión 2.0, un mismo servidor administra varias empresas por separado
 - **Facturación:** se factura todo equipo registrado al menos un día del mes, aunque después se dé de baja. El primer día de cada mes, el anterior se cierra y su número ya no cambia. Se exporta a CSV para Excel, con detalle por equipo.
 - **Suspensión:** al suspender una empresa, su panel se corta en el momento. Si en los días de gracia no se marca como pagada, sus TV Box muestran "Servicio suspendido, comuníquese con su proveedor". Al marcarla pagada vuelve todo.
 - **Marca:** cada empresa se muestra con su nombre y la frase fija (por ejemplo "por DBI") debajo, más chica, en su panel y en sus TV Box. En el TV Box se ve desde WiFly Launcher 1.3.0.
+- **Datos de la empresa** (desde 2.3): razón social, domicilio fiscal, tipo de impuesto (consumidor final, monotributista o responsable inscripto), CUIT/DNI/CUIL, email y teléfono de contacto. Son obligatorios al crearla. El CUIT/CUIL se controla con su dígito verificador, y monotributistas y responsables inscriptos llevan CUIT. Las empresas creadas antes de la 2.3 aparecen con "Faltan los datos fiscales" hasta completarlas con **Editar**. La facturación y su CSV incluyen razón social, CUIT y tipo de impuesto.
+- **Usuarios** (desde 2.3): cada usuario tiene nombre de usuario, nombre completo, nombre a mostrar en el panel, teléfono y email. La clave necesita 10 caracteres o más, con mayúscula, minúscula, número y carácter especial; el panel muestra qué falta y puede generar una. Las claves anteriores siguen sirviendo hasta que se cambien. Cada uno edita sus datos en **Cuenta**.
+
+### Clientes
+
+Cada empresa carga sus clientes en **Clientes**: un ID que pone a mano (el mismo de su sistema de gestión, para vincularlos por API más adelante), nombre completo, DNI/CUIT/CUIL, domicilio, teléfono y email. La lista se ordena por ID (2 va antes que 10) y muestra el teléfono y cuántos equipos tiene cada uno.
+
+Los equipos se asignan a un cliente de tres formas: al crear un token de alta con cliente (los equipos nuevos quedan asignados solos), desde el detalle del equipo, o eligiendo varios en **Pantallas** y tocando **Asignar cliente**. Desde la ficha del cliente se le pueden enviar mensajes, bloquear o desbloquear todos sus equipos juntos. El operador ve los clientes y puede hacer esas tres acciones, pero no los modifica. Borrar un cliente no toca sus equipos: quedan sin cliente.
+
+En **Pantallas**, el botón **Pantallas / Lista** cambia entre las pantallas de siempre y una lista con equipo, cliente, estado, red y perfil. El panel recuerda la elección en cada navegador.
+
+### Recuperar la clave por email
+
+En **Olvidé mi clave**, cualquier usuario escribe su usuario o su email y recibe un enlace válido por una hora, que sirve una sola vez. El administrador de una empresa que no cargó email propio lo recibe en el email de contacto de la empresa.
+
+Para que funcione, el administrador general configura una vez el **Correo saliente** en **Configuración**: servidor SMTP, puerto, seguridad, usuario, contraseña y remitente, y toca **Enviar prueba**. Sirve el correo de tu dominio o Gmail con una [contraseña de aplicación](https://myaccount.google.com/apppasswords) (servidor `smtp.gmail.com`, STARTTLS, puerto 587). Sin correo configurado, un administrador puede cambiar la clave de otro usuario desde **Usuarios**.
 
 ### Actualizar un servidor 1.x a multiempresa
 

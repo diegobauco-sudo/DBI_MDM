@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { createApp } from '../src/app.js';
+import { empresa, usuario } from './datos.js';
 
 // Usa el código real de la versión 1.2.1, sacado del historial, para generar una base vieja con datos.
 const here = path.dirname(new URL(import.meta.url).pathname);
@@ -39,8 +40,8 @@ after(() => { fs.rmSync(dir, { recursive: true, force: true }); fs.rmSync(oldDir
 
 test('una base de la v1.2.1 con datos se migra sin perder nada', { skip: !hasOld && 'sin acceso a la etiqueta v1.2.1' }, async () => {
   const { createApp: createOld } = await import(path.join(oldDir, 'app.js'));
-  const v1 = await serve(createOld, { adminPassword: 'clave-vieja-123' });
-  await v1.call('POST', '/api/login', { username: 'admin', password: 'clave-vieja-123' });
+  const v1 = await serve(createOld, { adminPassword: 'Clave-vieja-123' });
+  await v1.call('POST', '/api/login', { username: 'admin', password: 'Clave-vieja-123' });
   const profile = (await v1.call('GET', '/api/profiles')).body[0];
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/AAAMBAQAY3Y2wAAAAAElFTkSuQmCC', 'base64');
   const form = new FormData();
@@ -69,7 +70,7 @@ test('una base de la v1.2.1 con datos se migra sin perder nada', { skip: !hasOld
   assert.equal(poll.commands[0].payload.body, 'pendiente de entrega', 'los mensajes pendientes se entregan igual');
 
   // El administrador de siempre entra con su clave y ahora es administrador general.
-  assert.equal((await v2.call('POST', '/api/login', { username: 'admin', password: 'clave-vieja-123' })).status, 200);
+  assert.equal((await v2.call('POST', '/api/login', { username: 'admin', password: 'Clave-vieja-123' })).status, 200);
   const me = (await v2.call('GET', '/api/me')).body;
   assert.equal(me.role, 'superadmin');
   const companies = (await v2.call('GET', '/api/companies')).body;
@@ -93,17 +94,17 @@ test('una base de la v1.2.1 con datos se migra sin perder nada', { skip: !hasOld
 
   // Abrirla otra vez no vuelve a migrar ni duplica nada.
   const v3 = await serve(createApp, {});
-  await v3.call('POST', '/api/login', { username: 'admin', password: 'clave-vieja-123' });
+  await v3.call('POST', '/api/login', { username: 'admin', password: 'Clave-vieja-123' });
   assert.equal((await v3.call('GET', '/api/companies')).body[0].devices, 2);
   v3.stop();
 });
 
 test('una instalación nueva arranca sin empresas', async () => {
   const fresh = fs.mkdtempSync(path.join(os.tmpdir(), 'wifly-new-'));
-  const ctx = createApp({ dataDir: fresh, adminPassword: 'clave-nueva-123', billingIntervalMs: 0 });
+  const ctx = createApp({ dataDir: fresh, adminPassword: 'Clave-nueva-123', billingIntervalMs: 0 });
   assert.equal(ctx.db.prepare('SELECT COUNT(*) AS n FROM companies').get().n, 0);
   assert.equal(ctx.db.prepare(`SELECT role FROM users`).get().role, 'superadmin');
-  assert.equal(ctx.db.prepare('PRAGMA user_version').get().user_version, 3);
+  assert.equal(ctx.db.prepare('PRAGMA user_version').get().user_version, 4);
   ctx.close();
   fs.rmSync(fresh, { recursive: true, force: true });
 });

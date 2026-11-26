@@ -52,6 +52,7 @@ export function exportCompany(db, companyId) {
   return {
     company,
     users: all('SELECT * FROM users WHERE company_id=?'),
+    clients: all('SELECT * FROM clients WHERE company_id=?'),
     profiles: all('SELECT * FROM profiles WHERE company_id=?'),
     devices: all('SELECT * FROM devices WHERE company_id=?'),
     enrollTokens: all('SELECT * FROM enroll_tokens WHERE company_id=?'),

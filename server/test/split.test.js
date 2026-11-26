@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createApp } from '../src/app.js';
+import { empresa, usuario } from './datos.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wifly-split-'));
 const fixtures = path.join(path.dirname(new URL(import.meta.url).pathname), 'fixtures');
@@ -29,11 +30,11 @@ async function upload(name) {
 }
 
 before(async () => {
-  ctx = createApp({ dataDir: dir, adminPassword: 'clave-de-prueba-1', longPollMs: 500 });
+  ctx = createApp({ dataDir: dir, adminPassword: 'Clave-de-prueba-1', longPollMs: 500 });
   await new Promise((ok) => { srv = ctx.app.listen(0, ok); });
   base = `http://127.0.0.1:${srv.address().port}`;
-  await admin('POST', '/api/login', { username: 'admin', password: 'clave-de-prueba-1' });
-  const c = await admin('POST', '/api/companies', { name: 'Split SA' });
+  await admin('POST', '/api/login', { username: 'admin', password: 'Clave-de-prueba-1' });
+  const c = await admin('POST', '/api/companies', empresa('Split SA'));
   await admin('POST', '/api/context', { companyId: c.body.id });
   const token = (await admin('POST', '/api/enroll-tokens', {})).body.token;
   const e = await fetch(`${base}/api/device/enroll`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token, installId: 'splitdevice1' }) });

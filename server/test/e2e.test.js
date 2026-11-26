@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createApp } from '../src/app.js';
+import { empresa, usuario } from './datos.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wifly-'));
 let base, srv, ctx, cookie = '';
@@ -31,7 +32,7 @@ async function dev(token, method, url, body) {
 }
 
 before(async () => {
-  ctx = createApp({ dataDir: dir, adminPassword: 'clave-de-prueba-1', longPollMs: 1500 });
+  ctx = createApp({ dataDir: dir, adminPassword: 'Clave-de-prueba-1', longPollMs: 1500 });
   await new Promise((ok) => { srv = ctx.app.listen(0, ok); });
   base = `http://127.0.0.1:${srv.address().port}`;
 });
@@ -42,9 +43,9 @@ let token, deviceId, deviceToken, profileId, version;
 test('el panel exige sesión y rechaza claves incorrectas', async () => {
   assert.equal((await admin('GET', '/api/devices')).status, 401);
   assert.equal((await admin('POST', '/api/login', { username: 'admin', password: 'mal' })).status, 401);
-  assert.equal((await admin('POST', '/api/login', { username: 'admin', password: 'clave-de-prueba-1' })).status, 200);
+  assert.equal((await admin('POST', '/api/login', { username: 'admin', password: 'Clave-de-prueba-1' })).status, 200);
   assert.equal((await admin('GET', '/api/devices')).status, 409, 'el administrador general tiene que elegir una empresa');
-  const c = await admin('POST', '/api/companies', { name: 'Hotel Sur' });
+  const c = await admin('POST', '/api/companies', empresa('Hotel Sur'));
   assert.equal(c.status, 200);
   await admin('POST', '/api/context', { companyId: c.body.id });
   assert.equal((await admin('GET', '/api/devices')).status, 200);

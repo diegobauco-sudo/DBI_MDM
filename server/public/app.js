@@ -33,7 +33,7 @@ async function api(method, url, body) {
     throw new Error('No hay conexión con el servidor');
   }
   const data = await r.json().catch(() => ({}));
-  if (r.status === 401 && url !== '/api/login') {
+  if (r.status === 401 && url !== '/api/login' && !url.startsWith('/api/password/')) {
     showLogin();
     throw new Error('La sesión venció. Volvé a entrar.');
   }
@@ -115,8 +115,154 @@ function showLogin(message) {
     h('label', { for: 'u' }, 'Usuario'), user,
     h('label', { for: 'p' }, 'Clave'), pass,
     err,
-    h('button', { class: 'primary', type: 'submit' }, 'Entrar')))));
+    h('button', { class: 'primary', type: 'submit' }, 'Entrar'),
+    h('button', { type: 'button', class: 'linkish', onclick: () => showForgot(user.value) }, 'Olvidé mi clave')))));
   user.focus();
+}
+
+/** Pide el enlace de recuperación. La respuesta es la misma exista o no el usuario. */
+function showForgot(prefill = '') {
+  const login = h('input', { type: 'text', id: 'fl', autocomplete: 'username', required: true, value: prefill });
+  const msg = h('p', { class: 'err', hidden: true });
+  const send = h('button', { class: 'primary', type: 'submit' }, 'Enviar enlace');
+  $app.replaceChildren(h('div', { class: 'login' }, h('form', {
+    onsubmit: async (e) => {
+      e.preventDefault();
+      send.disabled = true;
+      try {
+        const r = await api('POST', '/api/password/forgot', { login: login.value });
+        msg.className = 'ok-msg';
+        msg.textContent = r.message;
+      } catch (ex) {
+        msg.className = 'err';
+        msg.textContent = ex.message;
+        send.disabled = false;
+      }
+      msg.hidden = false;
+    },
+  }, h('div', { class: 'glass' },
+    h('div', { class: 'brand' }, h('img', { src: 'icon.svg', alt: '' }), 'WiFly MDM'),
+    h('h2', {}, 'Recuperar la clave'),
+    h('p', {}, 'Escribí tu usuario o tu email. Te mandamos un enlace para elegir una clave nueva, válido por una hora.'),
+    h('label', { for: 'fl' }, 'Usuario o email'), login,
+    msg, send,
+    h('button', { type: 'button', class: 'linkish', onclick: () => showLogin() }, 'Volver a entrar')))));
+  login.focus();
+}
+
+/** Página del enlace del correo: elegir una clave nueva. */
+async function showReset(token) {
+  history.replaceState(null, '', location.pathname);
+  const box = h('div', { class: 'glass' }, h('div', { class: 'brand' }, h('img', { src: 'icon.svg', alt: '' }), 'WiFly MDM'));
+  $app.replaceChildren(h('div', { class: 'login' }, h('form', { onsubmit: (e) => e.preventDefault() }, box)));
+  let info;
+  try {
+    info = await api('POST', '/api/password/reset-info', { token });
+  } catch (ex) {
+    box.append(h('h2', {}, 'Enlace vencido'), h('p', { class: 'err' }, ex.message), h('button', { class: 'primary', type: 'button', onclick: () => showForgot() }, 'Pedir otro enlace'));
+    return;
+  }
+  const pw = passwordField('rp1', 'Clave nueva');
+  const again = h('input', { type: 'password', id: 'rp2', autocomplete: 'new-password' });
+  const err = h('p', { class: 'err', hidden: true });
+  box.append(h('h2', {}, `Hola, ${info.displayName}`), h('p', {}, 'Elegí la clave nueva para el usuario ', h('strong', {}, info.username), '.'),
+    pw.el, h('label', { for: 'rp2' }, 'Repetí la clave nueva'), again, err,
+    h('button', { class: 'primary', type: 'button', onclick: async () => {
+      err.hidden = true;
+      try {
+        if (pw.input.value !== again.value) throw new Error('Las dos claves no coinciden');
+        await api('POST', '/api/password/reset', { token, password: pw.input.value });
+        showLogin();
+        toast('Clave cambiada. Ya podés entrar con la nueva.');
+      } catch (ex) {
+        err.textContent = ex.message;
+        err.hidden = false;
+      }
+    } }, 'Guardar clave nueva'));
+  pw.input.focus();
+}
+
+// ---- Formularios compartidos -----------------------------------------------------------------
+const PW_RULES = [
+  ['10 caracteres o más', (s) => s.length >= 10],
+  ['una mayúscula', (s) => /[A-ZÁÉÍÓÚÑ]/.test(s)],
+  ['una minúscula', (s) => /[a-záéíóúñ]/.test(s)],
+  ['un número', (s) => /[0-9]/.test(s)],
+  ['un carácter especial', (s) => /[^A-Za-z0-9ÁÉÍÓÚÑáéíóúñ]/.test(s)],
+];
+
+/** Clave al azar que cumple la política, sin caracteres que se confundan al dictarla. */
+function generatePassword() {
+  const sets = ['ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnpqrstuvwxyz', '23456789', '!#$%&*+-=?@_'];
+  const all = sets.join('');
+  const rnd = (n) => crypto.getRandomValues(new Uint32Array(1))[0] % n;
+  const chars = sets.map((set) => set[rnd(set.length)]);
+  while (chars.length < 14) chars.push(all[rnd(all.length)]);
+  for (let i = chars.length - 1; i > 0; i--) { const j = rnd(i + 1); [chars[i], chars[j]] = [chars[j], chars[i]]; }
+  return chars.join('');
+}
+
+/** Campo de clave con los requisitos a la vista, que se tildan a medida que se cumplen. */
+function passwordField(id, label) {
+  const input = h('input', { type: 'password', id, autocomplete: 'new-password', 'aria-describedby': `${id}-rules` });
+  const items = PW_RULES.map(([t]) => h('li', {}, t));
+  const paint = () => PW_RULES.forEach(([, test], i) => items[i].classList.toggle('ok', test(input.value)));
+  input.addEventListener('input', paint);
+  const show = h('button', { type: 'button', class: 'plain', onclick: () => {
+    input.type = input.type === 'password' ? 'text' : 'password';
+    show.textContent = input.type === 'password' ? 'Mostrar' : 'Ocultar';
+  } }, 'Mostrar');
+  const gen = h('button', { type: 'button', class: 'plain', onclick: () => {
+    input.value = generatePassword();
+    input.type = 'text';
+    show.textContent = 'Ocultar';
+    paint();
+  } }, 'Generar');
+  paint();
+  return { input, el: h('div', { class: 'field' }, h('label', { for: id }, label), h('div', { class: 'pw-row' }, input, show, gen),
+    h('ul', { class: 'pw-rules', id: `${id}-rules` }, items)) };
+}
+
+/** Un campo con su etiqueta. `span` lo hace ocupar las dos columnas. */
+function field(id, label, props = {}, { span = false, hint = '', el = 'input' } = {}) {
+  const input = h(el, { id, type: el === 'input' ? 'text' : undefined, ...props });
+  return { input, el: h('div', { class: span ? 'span2' : null }, h('label', { for: id }, label), input, hint ? h('p', { class: 'hint' }, hint) : null) };
+}
+
+/** Datos de un usuario del panel: nombre, nombre a mostrar, teléfono y email. */
+function userFields(prefix, u = {}, { emailHint = 'También sirve para recuperar la clave.', emailRequired = true } = {}) {
+  const f = {
+    fullName: field(`${prefix}-fn`, 'Nombre completo', { value: u.fullName || '', maxlength: 80, autocomplete: 'off' }),
+    displayName: field(`${prefix}-dn`, 'Nombre a mostrar en el panel', { value: u.displayName || '', maxlength: 40, autocomplete: 'off' }, { hint: 'Vacío: el nombre completo.' }),
+    phone: field(`${prefix}-ph`, 'Teléfono', { type: 'tel', value: u.phone || '', maxlength: 30, autocomplete: 'off' }),
+    email: field(`${prefix}-em`, emailRequired ? 'Email' : 'Email (opcional)', { type: 'email', value: u.email || '', maxlength: 120, autocomplete: 'off' }, { hint: emailHint }),
+  };
+  return {
+    els: Object.values(f).map((x) => x.el),
+    values: () => Object.fromEntries(Object.entries(f).map(([k, x]) => [k, x.input.value])),
+    focus: () => f.fullName.input.focus(),
+  };
+}
+
+const TAX = [['', 'Elegí una opción'], ['cf', 'Consumidor final'], ['mono', 'Monotributista'], ['ri', 'Responsable inscripto']];
+
+/** Datos fiscales y de contacto de una empresa. */
+function companyFields(c = {}) {
+  const cond = h('select', { id: 'co-tc' }, TAX.map(([v, t]) => h('option', { value: v, selected: (c.taxCondition || '') === v, disabled: v === '' }, t)));
+  const f = {
+    name: field('co-n', 'Nombre de la empresa', { value: c.name || '', maxlength: 60 }, { hint: 'Así la ven en su panel y en los TV Box.' }),
+    legalName: field('co-ln', 'Razón social', { value: c.legalName || '', maxlength: 120 }),
+    taxAddress: field('co-ta', 'Domicilio fiscal', { value: c.taxAddress || '', maxlength: 200 }, { span: true }),
+    taxCondition: { input: cond, el: h('div', {}, h('label', { for: 'co-tc' }, 'Tipo de impuesto'), cond) },
+    taxId: field('co-ti', 'CUIT, DNI o CUIL', { value: c.taxId || '', maxlength: 20, inputmode: 'numeric' }, { hint: 'Monotributista y responsable inscripto: CUIT.' }),
+    email: field('co-em', 'Email de contacto', { type: 'email', value: c.email || '', maxlength: 120 }, { hint: 'Si el administrador no carga uno propio, recupera su clave con este.' }),
+    phone: field('co-ph', 'Teléfono de contacto', { type: 'tel', value: c.phone || '', maxlength: 30 }),
+  };
+  return {
+    els: Object.values(f).map((x) => x.el),
+    values: () => Object.fromEntries(Object.entries(f).map(([k, x]) => [k, x.input.value])),
+    focus: () => f.name.input.focus(),
+  };
 }
 
 // ---- Marco -----------------------------------------------------------------------------------
@@ -128,6 +274,7 @@ const VIEWS = [
   ['backups', 'Respaldos', () => viewBackups('general'), 'g'],
   ['settings', 'Configuración', viewSettings, 'g'],
   ['wall', 'Pantallas', viewWall, 'ao'],
+  ['clients', 'Clientes', viewClients, 'ao'],
   ['profiles', 'Perfiles', viewProfiles, 'a'],
   ['library', 'Biblioteca', viewLibrary, 'a'],
   ['sends', 'Envíos', viewSends, 'ao'],
@@ -172,6 +319,7 @@ async function start() {
         h('button', { class: 'rail-back', onclick: guard(() => setContext(null)) }, 'Volver a empresas')) : null,
       companyViews.map(navButton),
       h('div', { class: 'bottom' },
+        h('div', { class: 'rail-user' }, me.displayName),
         navButton(['account', 'Cuenta']),
         h('button', { onclick: guard(async () => { await api('POST', '/api/logout', {}); showLogin(); }) }, 'Salir'))),
     $main));
@@ -212,29 +360,45 @@ const header = (title, ...rest) => h('div', { class: 'head' }, h('h1', {}, title
 
 // ---- Pantallas --------------------------------------------------------------------------------
 const selected = new Set();
-const filter = { text: '', status: '', group: '' };
+const filter = { text: '', status: '', group: '', client: '' };
 let devices = [];
 let profilesCache = [];
+let clientsCache = [];
+const store = {
+  get: (k, d) => { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch { /* sin almacenamiento */ } },
+};
+let wallMode = store.get('wifly-wall-mode', 'screens');
+const clientLabel = (c) => `${c.extId} · ${c.name}`;
 
 async function viewWall() {
-  profilesCache = canAdmin() ? await api('GET', '/api/profiles') : [];
+  [profilesCache, clientsCache] = await Promise.all([canAdmin() ? api('GET', '/api/profiles') : [], api('GET', '/api/clients')]);
   const wallBox = h('div');
   const count = h('span', { class: 'count' });
   const groupSel = h('select', { 'aria-label': 'Grupo', onchange: (e) => { filter.group = e.target.value; paint(); } });
+  if (filter.client && !clientsCache.some((c) => String(c.id) === filter.client) && filter.client !== 'none') filter.client = '';
+  const clientSel = clientsCache.length ? h('select', { 'aria-label': 'Cliente', onchange: (e) => { filter.client = e.target.value; paint(); } },
+    h('option', { value: '' }, 'Todos los clientes'), h('option', { value: 'none', selected: filter.client === 'none' }, 'Sin cliente'),
+    clientsCache.map((c) => h('option', { value: c.id, selected: String(c.id) === filter.client }, clientLabel(c)))) : null;
+  const modeBtn = (mode, label) => h('button', { 'aria-pressed': String(wallMode === mode), onclick: () => { wallMode = mode; store.set('wifly-wall-mode', mode); toggle.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.m === mode))); paint(); }, 'data-m': mode }, label);
+  const toggle = h('div', { class: 'view-toggle', role: 'group', 'aria-label': 'Cómo ver los equipos' }, modeBtn('screens', 'Pantallas'), modeBtn('list', 'Lista'));
   fill(
     header('Pantallas', count),
     h('div', { class: 'filters' },
       h('input', { type: 'search', placeholder: 'Buscar por nombre, modelo o IP', 'aria-label': 'Buscar', value: filter.text, oninput: (e) => { filter.text = e.target.value.toLowerCase(); paint(); } }),
       h('select', { 'aria-label': 'Estado', onchange: (e) => { filter.status = e.target.value; paint(); } },
         [['', 'Todos los estados'], ['online', 'En línea'], ['offline', 'Sin señal'], ['blocked', 'Bloqueados'], ['alert', 'Con alertas']].map(([v, t]) => h('option', { value: v, selected: filter.status === v }, t))),
-      groupSel,
-      h('button', { onclick: () => { visible().forEach((d) => selected.add(d.id)); paint(); } }, 'Seleccionar los visibles')),
+      groupSel, clientSel,
+      h('button', { onclick: () => { visible().forEach((d) => selected.add(d.id)); paint(); } }, 'Seleccionar los visibles'),
+      toggle),
     wallBox);
 
   const visible = () => devices.filter((d) => {
-    const hay = `${d.name} ${d.state.model || ''} ${d.state.ip || ''} ${d.group}`.toLowerCase();
+    const hay = `${d.name} ${d.state.model || ''} ${d.state.ip || ''} ${d.group} ${d.clientExtId} ${d.clientName}`.toLowerCase();
     if (filter.text && !hay.includes(filter.text)) return false;
     if (filter.group && d.group !== filter.group) return false;
+    if (filter.client === 'none' && d.clientId) return false;
+    if (filter.client && filter.client !== 'none' && String(d.clientId) !== filter.client) return false;
     if (filter.status === 'online' && !d.online) return false;
     if (filter.status === 'offline' && d.online) return false;
     if (filter.status === 'blocked' && !d.blocked) return false;
@@ -255,6 +419,9 @@ async function viewWall() {
         h('h2', {}, 'Todavía no hay equipos'),
         h('p', {}, 'Creá un token en Alta de equipos y usalo para instalar WiFly Launcher en tu primer TV Box.'),
         h('button', { class: 'primary', onclick: () => go('enroll') }, 'Dar de alta un equipo')));
+    } else if (wallMode === 'list') {
+      const list = visible();
+      wallBox.replaceChildren(list.length ? deviceTable(list) : h('div', { class: 'empty' }, h('p', {}, 'Ningún equipo coincide con el filtro.')));
     } else {
       const list = visible();
       const byGroup = new Map();
@@ -267,6 +434,32 @@ async function viewWall() {
     }
     paintBar();
     if (focusId) document.querySelector(`[data-id="${CSS.escape(focusId)}"]`)?.focus();
+  }
+
+  /** Vista en lista: una fila por equipo, con la misma selección que las pantallas. */
+  function deviceTable(list) {
+    const allSel = list.every((d) => selected.has(d.id));
+    const toggleOne = (d) => { if (selected.has(d.id)) selected.delete(d.id); else selected.add(d.id); paint(); };
+    return h('div', { class: 'sheet' }, h('div', { class: 'table-wrap' }, h('table', { class: 'devices' },
+      h('thead', {}, h('tr', {},
+        h('th', {}, h('input', { type: 'checkbox', checked: allSel, 'aria-label': 'Seleccionar todos los visibles', onchange: () => { list.forEach((d) => (allSel ? selected.delete(d.id) : selected.add(d.id))); paint(); } })),
+        ['Equipo', 'Cliente', 'Estado', 'Red', 'Perfil', ''].map((t) => h('th', { class: t === 'Red' || t === 'Perfil' ? 'opt' : null }, t)))),
+      h('tbody', {}, list.map((d) => {
+        const alerts = alertsOf(d);
+        let state;
+        if (d.suspended) state = [h('span', { class: 'dot bad' }), 'Servicio suspendido'];
+        else if (d.blocked) state = [h('span', { class: 'dot bad' }), `Bloqueado${d.blockTitle ? `: ${d.blockTitle}` : ''}`];
+        else if (d.online) state = [h('span', { class: 'dot on' }), d.state.kiosk === false ? 'En línea, fuera del kiosko' : 'En línea'];
+        else state = [h('span', { class: 'dot' }), `Sin señal, visto ${ago(d.lastSeen)}`];
+        return h('tr', { class: selected.has(d.id) ? 'sel' : null },
+          h('td', {}, h('input', { type: 'checkbox', checked: selected.has(d.id), 'data-id': d.id, 'aria-label': `Seleccionar ${d.name}`, onchange: () => toggleOne(d) })),
+          h('td', {}, h('strong', {}, d.name), h('br'), h('small', {}, [d.state.model, d.group].filter(Boolean).join(' · '))),
+          h('td', {}, d.clientId ? [d.clientName, h('br'), h('small', {}, `ID ${d.clientExtId}`)] : h('span', { class: 'hint' }, 'Sin cliente')),
+          h('td', {}, state, alerts.length ? [h('br'), h('small', { class: 'alert-line' }, alerts[0])] : null),
+          h('td', { class: 'opt' }, d.state.network || '', d.state.ip ? [h('br'), h('small', {}, d.state.ip)] : null),
+          h('td', { class: 'opt' }, d.profileName),
+          h('td', {}, h('button', { class: 'plain', onclick: () => openDevice(d.id, load) }, 'Ver')));
+      })))));
   }
 
   function unit(d) {
@@ -296,6 +489,7 @@ async function viewWall() {
         h('div', {},
           h('div', { class: 'name' }, d.name),
           h('div', { class: 'sub' }, d.online ? (d.state.network || 'En línea') : `Visto ${ago(d.lastSeen)}`),
+          d.clientId ? h('div', { class: 'sub' }, `Cliente ${d.clientExtId}, ${d.clientName}`) : null,
           alerts.length ? h('div', { class: 'alert-line' }, alerts[0]) : null),
         h('button', { class: 'plain', onclick: () => openDevice(d.id, load) }, 'Ver')));
   }
@@ -310,6 +504,7 @@ async function viewWall() {
       h('button', { class: 'stop', onclick: () => lockDialog(ids, load) }, 'Bloquear'),
       h('button', { onclick: guard(() => bulk(ids, 'unlock', {}, 'Desbloqueo enviado', load)) }, 'Desbloquear'),
       canAdmin() ? h('button', { onclick: () => assignDialog(ids, load) }, 'Cambiar perfil') : null,
+      canAdmin() ? h('button', { onclick: () => assignClientDialog(ids, load) }, 'Asignar cliente') : null,
       canAdmin() ? h('button', { onclick: () => confirmDialog('Reiniciar equipos', `Se van a reiniciar ${plural(ids.length, 'equipo', 'equipos')}. Quien esté mirando algo se va a cortar.`, 'Reiniciar', true, () => bulk(ids, 'reboot', {}, 'Reinicio enviado', load)) }, 'Reiniciar') : null,
       h('span', { class: 'spacer' }),
       h('button', { onclick: () => { selected.clear(); paint(); } }, 'Quitar selección')));
@@ -392,6 +587,19 @@ function assignDialog(ids, after) {
   ]);
 }
 
+async function assignClientDialog(ids, after) {
+  const clients = await api('GET', '/api/clients');
+  if (!clients.length) return toast('Primero cargá un cliente en Clientes', true);
+  const sel = h('select', { id: 'acl' }, h('option', { value: '' }, 'Sin cliente'), clients.map((c) => h('option', { value: c.id }, clientLabel(c))));
+  const d = dialog(`Asignar cliente a ${plural(ids.length, 'equipo', 'equipos')}`, h('div', {}, h('label', { for: 'acl' }, 'Cliente'), sel), [
+    h('button', { onclick: () => d.close() }, 'Cancelar'),
+    h('button', { class: 'primary', onclick: guard(async () => {
+      await bulk(ids, 'assignClient', { clientId: sel.value ? Number(sel.value) : null }, 'Cliente asignado', after);
+      d.close();
+    }) }, 'Asignar cliente'),
+  ]);
+}
+
 // ---- Detalle de un equipo --------------------------------------------------------------------
 const STATUS = { pending: ['Esperando al equipo', ''], sent: ['Entregado', ''], done: ['Hecho', 'ok'], failed: ['Falló', 'bad'], expired: ['Venció', 'warn'] };
 const COMMAND = { message: 'Mensaje', reboot: 'Reinicio', sync: 'Sincronización', install: 'Instalar app', uninstall: 'Desinstalar app', exitKiosk: 'Salir del kiosko', enterKiosk: 'Activar kiosko', decommission: 'Dar de baja' };
@@ -399,13 +607,14 @@ const statusPill = (s) => h('span', { class: `pill ${STATUS[s]?.[1] || ''}` }, S
 
 async function openDevice(id, onChange) {
   const admin = canAdmin();
-  const [d, files, profiles] = await Promise.all([api('GET', `/api/devices/${id}`), admin ? api('GET', '/api/files') : [], admin ? api('GET', '/api/profiles') : []]);
+  const [d, files, profiles, clients] = await Promise.all([api('GET', `/api/devices/${id}`), admin ? api('GET', '/api/files') : [], admin ? api('GET', '/api/profiles') : [], admin ? api('GET', '/api/clients') : []]);
   const s = d.state;
   const refresh = async () => { dlg.close(); await onChange?.(); await openDevice(id, onChange); };
   const name = h('input', { type: 'text', id: 'dn', value: d.name, maxlength: 80 });
   const group = h('input', { type: 'text', id: 'dg', value: d.group, maxlength: 60 });
   const profile = h('select', { id: 'dp' }, profiles.map((p) => h('option', { value: p.id, selected: p.id === d.profileId }, p.name)));
   const notes = h('textarea', { id: 'dnotes', maxlength: 500, value: d.notes });
+  const client = h('select', { id: 'dcl' }, h('option', { value: '' }, 'Sin cliente'), clients.map((c) => h('option', { value: c.id, selected: c.id === d.clientId }, clientLabel(c))));
   const apk = h('select', { 'aria-label': 'APK para instalar' }, h('option', { value: '' }, 'Elegí un APK'), files.filter((f) => f.kind === 'apk').map((f) => h('option', { value: f.sha }, `${f.name} ${f.versionName}`)));
   const act = (action, payload, msg) => guard(async () => { await bulk([id], action, payload, msg); await refresh(); });
 
@@ -439,7 +648,7 @@ async function openDevice(id, onChange) {
       d.synced ? h('span', { class: 'pill ok' }, 'Perfil aplicado') : h('span', { class: 'pill warn' }, 'Perfil pendiente')),
     alerts.map((a) => h('div', { class: 'note' }, a)),
     h('dl', { class: 'facts' },
-      [['Modelo', `${s.manufacturer || ''} ${s.model || ''}`], ['Android', s.androidVersion ? `${s.androidVersion} (API ${s.sdk})` : ''],
+      [['Cliente', d.clientId ? `${d.clientName} (ID ${d.clientExtId})` : ''], ['Modelo', `${s.manufacturer || ''} ${s.model || ''}`], ['Android', s.androidVersion ? `${s.androidVersion} (API ${s.sdk})` : ''],
       ['Launcher', s.launcherVersion || ''], ['Red', s.network || ''], ['IP local', s.ip || ''], ['IP pública', d.publicIp], ['MAC', s.mac || ''],
       ['Kiosko', s.kiosk === false ? 'Desactivado' : s.mode === 'compat' ? 'Activo, modo compatible' : (s.lockTask ? 'Activo' : 'Sin confirmar')]].flatMap(([k, v]) => (v ? [h('dt', {}, k), h('dd', {}, v)] : []))),
 
@@ -458,10 +667,11 @@ async function openDevice(id, onChange) {
     admin ? [h('h3', {}, 'Datos'),
     h('label', { for: 'dn' }, 'Nombre'), name,
     h('label', { for: 'dg' }, 'Grupo'), group,
+    h('label', { for: 'dcl' }, 'Cliente'), client,
     h('label', { for: 'dp' }, 'Perfil'), profile,
     h('label', { for: 'dnotes' }, 'Notas'), notes,
     h('div', { class: 'save-bar' }, h('button', { class: 'primary', onclick: guard(async () => {
-      await api('PATCH', `/api/devices/${id}`, { name: name.value, group: group.value, profileId: Number(profile.value), notes: notes.value });
+      await api('PATCH', `/api/devices/${id}`, { name: name.value, group: group.value, profileId: Number(profile.value), notes: notes.value, clientId: client.value ? Number(client.value) : null });
       toast('Cambios guardados');
       await refresh();
     }) }, 'Guardar cambios'))] : null,
@@ -694,7 +904,8 @@ async function viewSends() {
 
 // ---- Alta de equipos ---------------------------------------------------------------------------------
 async function viewEnroll() {
-  const [tokens, profiles] = await Promise.all([api('GET', '/api/enroll-tokens'), api('GET', '/api/profiles')]);
+  const [tokens, profiles, clients] = await Promise.all([api('GET', '/api/enroll-tokens'), api('GET', '/api/profiles'), api('GET', '/api/clients')]);
+  const client = h('select', { id: 't-c' }, h('option', { value: '' }, 'Sin cliente'), clients.map((c) => h('option', { value: c.id }, clientLabel(c))));
   const label = h('input', { type: 'text', id: 't-l', maxlength: 80, placeholder: 'Lote hotel, noviembre' });
   const profile = h('select', { id: 't-p' }, profiles.map((p) => h('option', { value: p.id }, p.name)));
   const group = h('input', { type: 'text', id: 't-g', maxlength: 60 });
@@ -709,10 +920,12 @@ async function viewEnroll() {
       h('label', { for: 't-l' }, 'Nombre'), label,
       h('label', { for: 't-p' }, 'Perfil'), profile,
       h('label', { for: 't-g' }, 'Grupo'), group,
+      h('label', { for: 't-c' }, 'Cliente'), client,
+      h('p', { class: 'hint' }, 'Los equipos que se den de alta con este token quedan asignados a este cliente.'),
       h('label', { for: 't-m' }, 'Máximo de equipos (0 = sin límite)'), maxUses,
       h('label', { for: 't-d' }, 'Días de validez (0 = no vence)'), days,
       h('div', { class: 'save-bar' }, h('button', { class: 'primary', onclick: guard(async () => {
-        await api('POST', '/api/enroll-tokens', { label: label.value, profileId: Number(profile.value), group: group.value, maxUses: Number(maxUses.value), days: Number(days.value) });
+        await api('POST', '/api/enroll-tokens', { label: label.value, profileId: Number(profile.value), group: group.value, clientId: client.value ? Number(client.value) : null, maxUses: Number(maxUses.value), days: Number(days.value) });
         go('enroll');
       }) }, 'Crear token'))),
     tokens.map((t) => {
@@ -720,7 +933,7 @@ async function viewEnroll() {
       const full = t.maxUses && t.uses >= t.maxUses;
       return h('div', { class: 'sheet' },
         h('h2', {}, t.label || 'Token sin nombre', ' ', expired ? h('span', { class: 'pill bad' }, 'Vencido') : full ? h('span', { class: 'pill warn' }, 'Agotado') : h('span', { class: 'pill ok' }, 'Activo')),
-        h('p', {}, `Perfil ${profiles.find((p) => p.id === t.profileId)?.name || 'sin asignar'}${t.group ? `, grupo ${t.group}` : ''}. Usado ${t.uses}${t.maxUses ? ` de ${t.maxUses}` : ''} veces${t.expiresAt ? `. Vence ${dateTime(t.expiresAt)}` : ''}.`),
+        h('p', {}, `Perfil ${profiles.find((p) => p.id === t.profileId)?.name || 'sin asignar'}${t.group ? `, grupo ${t.group}` : ''}${t.clientName ? `, cliente ${t.clientName}` : ''}. Usado ${t.uses}${t.maxUses ? ` de ${t.maxUses}` : ''} veces${t.expiresAt ? `. Vence ${dateTime(t.expiresAt)}` : ''}.`),
         h('p', {}, 'Con el TV Box conectado por ADB, corré desde la carpeta de instalación:'),
         h('pre', {}, `./enroll.sh --server ${origin} --token ${t.token}`),
         h('p', { class: 'hint' }, 'En Windows: ', h('code', {}, `enroll.bat ${origin} ${t.token}`)),
@@ -730,24 +943,40 @@ async function viewEnroll() {
 
 // ---- Cuenta -----------------------------------------------------------------------------------------
 async function viewAccount() {
+  const data = userFields('me', me);
   const cur = h('input', { type: 'password', id: 'c-c', autocomplete: 'current-password' });
-  const nxt = h('input', { type: 'password', id: 'c-n', autocomplete: 'new-password' });
+  const nxt = passwordField('c-n', 'Clave nueva');
   fill(
     header('Cuenta'),
     h('div', { class: 'sheet' }, h('p', {}, 'Entraste como ', h('strong', {}, me.username), `, ${ROLE[me.role]}`, me.company && !isSuper() ? ` de ${me.company.name}` : '', '.'),
+      h('h2', {}, 'Tus datos'),
+      me.email ? null : h('div', { class: 'note' }, 'Cargá tu email: sin él no vas a poder recuperar la clave si te la olvidás.'),
+      h('div', { class: 'form-grid' }, data.els),
+      h('div', { class: 'save-bar' }, h('button', { class: 'primary', onclick: guard(async () => {
+        const r = await api('PUT', '/api/me', data.values());
+        Object.assign(me, r);
+        document.querySelector('.rail-user').textContent = r.displayName;
+        toast('Datos guardados');
+        go('account');
+      }) }, 'Guardar datos'))),
+    h('div', { class: 'sheet' },
       h('h2', {}, 'Cambiar clave del panel'),
       h('label', { for: 'c-c' }, 'Clave actual'), cur,
-      h('label', { for: 'c-n' }, 'Clave nueva (10 caracteres o más)'), nxt,
+      nxt.el,
       h('div', { class: 'save-bar' }, h('button', { class: 'primary', onclick: guard(async () => {
-        await api('POST', '/api/password', { current: cur.value, next: nxt.value });
+        await api('POST', '/api/password', { current: cur.value, next: nxt.input.value });
         cur.value = '';
-        nxt.value = '';
+        nxt.input.value = '';
+        nxt.input.dispatchEvent(new Event('input'));
         toast('Clave cambiada');
       }) }, 'Cambiar clave'))));
 }
 
 // ---- Arranque --------------------------------------------------------------------------------------
-start().catch(() => {});
+if (location.hash.startsWith('#reset=')) showReset(location.hash.slice(7));
+else start().catch(() => {});
+// El enlace del correo también funciona si el panel ya estaba abierto en esa pestaña.
+window.addEventListener('hashchange', () => { if (location.hash.startsWith('#reset=')) showReset(location.hash.slice(7)); });
 
 // ---- Vistas compartidas -------------------------------------------------------------------------
 const ROLE = { superadmin: 'administrador general', admin: 'administrador', operator: 'operador' };
@@ -762,44 +991,185 @@ function auditTable(rows) {
 // ---- Usuarios --------------------------------------------------------------------------------------
 /** Sin empresa elegida (administrador general): los administradores generales. Con empresa: sus usuarios. */
 function usersSheet(users, roles, title, intro) {
-  const user = h('input', { type: 'text', id: 'nu-u', maxlength: 40, autocomplete: 'off' });
-  const pass = h('input', { type: 'password', id: 'nu-p', autocomplete: 'new-password' });
-  const role = h('select', { id: 'nu-r' }, roles.map(([v, t]) => h('option', { value: v }, t)));
   const reset = (u) => {
-    const p = h('input', { type: 'password', id: 'rp', autocomplete: 'new-password' });
-    const d = dialog(`Nueva clave para ${u.username}`, h('div', {}, h('label', { for: 'rp' }, 'Clave nueva (10 caracteres o más)'), p,
+    const pw = passwordField('rp', 'Clave nueva');
+    const d = dialog(`Nueva clave para ${u.displayName || u.username}`, h('div', {}, pw.el,
       h('p', { class: 'hint' }, 'Sus sesiones abiertas se cierran. Pasale la clave por un medio seguro.')), [
       h('button', { onclick: () => d.close() }, 'Cancelar'),
-      h('button', { class: 'primary', onclick: guard(async () => { await api('POST', `/api/users/${u.id}/password`, { password: p.value }); d.close(); toast('Clave cambiada'); }) }, 'Cambiar clave'),
+      h('button', { class: 'primary', onclick: guard(async () => { await api('POST', `/api/users/${u.id}/password`, { password: pw.input.value }); d.close(); toast('Clave cambiada'); }) }, 'Cambiar clave'),
     ]);
-    p.focus();
+    pw.input.focus();
+  };
+  const edit = (u) => {
+    const data = userFields('eu', u);
+    const d = dialog(`Datos de ${u.username}`, h('div', { class: 'form-grid' }, data.els), [
+      h('button', { onclick: () => d.close() }, 'Cancelar'),
+      h('button', { class: 'primary', onclick: guard(async () => { await api('PATCH', `/api/users/${u.id}`, data.values()); d.close(); toast('Datos guardados'); go(current); }) }, 'Guardar datos'),
+    ], 'xwide');
+    data.focus();
+  };
+  const create = () => {
+    const user = field('nu-u', 'Nombre de usuario', { maxlength: 40, autocomplete: 'off' }, { hint: 'Con este entra al panel. Letras, números, punto, guion o @.' });
+    const role = h('select', { id: 'nu-r' }, roles.map(([v, t]) => h('option', { value: v }, t)));
+    const pw = passwordField('nu-p', 'Clave');
+    const data = userFields('nu');
+    const d = dialog('Crear usuario', h('div', { class: 'form-grid' },
+      user.el,
+      roles.length > 1 ? h('div', {}, h('label', { for: 'nu-r' }, 'Rol'), role) : h('div'),
+      h('div', { class: 'span2' }, pw.el),
+      ...data.els,
+      roles.some(([v]) => v === 'operator') ? h('p', { class: 'hint span2' }, 'El operador solo puede enviar mensajes, bloquear y desbloquear equipos.') : null), [
+      h('button', { onclick: () => d.close() }, 'Cancelar'),
+      h('button', { class: 'primary', onclick: guard(async () => {
+        await api('POST', '/api/users', { username: user.input.value, password: pw.input.value, role: role.value, ...data.values() });
+        d.close();
+        toast(`Usuario ${user.input.value} creado`);
+        go(current);
+      }) }, 'Crear usuario'),
+    ], 'xwide');
+    user.input.focus();
   };
   const manageable = (u) => u.username !== me.username && (isSuper() || u.role === 'operator');
-  return [
-    h('div', { class: 'sheet' }, h('h2', {}, title), intro ? h('p', {}, intro) : null,
-      h('div', { class: 'table-wrap' }, h('table', {},
-        h('thead', {}, h('tr', {}, ['Usuario', 'Rol', ''].map((t) => h('th', {}, t)))),
-        h('tbody', {}, users.map((u) => h('tr', {}, h('td', {}, u.username, u.username === me.username ? ' (vos)' : ''), h('td', {}, u.roleLabel),
-          h('td', {}, manageable(u) ? h('div', { class: 'row-actions' },
-            h('button', { onclick: () => reset(u) }, 'Cambiar clave'),
-            h('button', { class: 'danger', onclick: () => confirmDialog('Eliminar usuario', `${u.username} ya no va a poder entrar al panel.`, 'Eliminar usuario', true, guard(async () => { await api('DELETE', `/api/users/${u.id}`); go(current); })) }, 'Eliminar')) : null))))))),
-    h('div', { class: 'sheet' }, h('h2', {}, 'Crear usuario'),
-      h('label', { for: 'nu-u' }, 'Usuario'), user,
-      h('label', { for: 'nu-p' }, 'Clave (10 caracteres o más)'), pass,
-      roles.length > 1 ? [h('label', { for: 'nu-r' }, 'Rol'), role] : null,
-      roles.some(([v]) => v === 'operator') ? h('p', { class: 'hint' }, 'El operador solo puede enviar mensajes, bloquear y desbloquear equipos.') : null,
-      h('div', { class: 'save-bar' }, h('button', { class: 'primary', onclick: guard(async () => {
-        await api('POST', '/api/users', { username: user.value, password: pass.value, role: role.value });
-        toast(`Usuario ${user.value} creado`);
-        go(current);
-      }) }, 'Crear usuario'))),
-  ];
+  return h('div', { class: 'sheet' },
+    h('div', { class: 'sheet-head' }, h('h2', {}, title), h('button', { class: 'primary', onclick: create }, 'Crear usuario')),
+    intro ? h('p', {}, intro) : null,
+    h('div', { class: 'table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Usuario', 'Nombre', 'Contacto', 'Rol', ''].map((t) => h('th', {}, t)))),
+      h('tbody', {}, users.map((u) => h('tr', {},
+        h('td', {}, h('strong', {}, u.username), u.username === me.username ? ' (vos)' : ''),
+        h('td', {}, u.fullName || h('span', { class: 'hint' }, 'Sin cargar'), u.displayName && u.displayName !== u.fullName ? [h('br'), h('small', {}, `Se muestra como ${u.displayName}`)] : null),
+        h('td', {}, u.email || h('span', { class: 'hint' }, 'Sin email'), u.phone ? [h('br'), h('small', {}, u.phone)] : null),
+        h('td', {}, u.roleLabel),
+        h('td', {}, manageable(u) ? h('div', { class: 'row-actions' },
+          h('button', { onclick: () => edit(u) }, 'Editar datos'),
+          h('button', { onclick: () => reset(u) }, 'Cambiar clave'),
+          h('button', { class: 'danger', onclick: () => confirmDialog('Eliminar usuario', `${u.username} ya no va a poder entrar al panel.`, 'Eliminar usuario', true, guard(async () => { await api('DELETE', `/api/users/${u.id}`); go(current); })) }, 'Eliminar')) : null)))))));
 }
 
 async function viewUsers() {
   const users = await api('GET', '/api/users');
   const roles = isSuper() ? [['admin', 'Administrador de la empresa'], ['operator', 'Operador']] : [['operator', 'Operador']];
-  fill(header('Usuarios'), usersSheet(users, roles, `Usuarios de ${me.company.name}`, ''));
+  fill(header('Usuarios'), usersSheet(users, roles, `Usuarios de ${me.company.name}`, isSuper() ? '' : 'Podés crear operadores. Para sumar otro administrador, pedíselo a tu proveedor.'));
+}
+
+// ---- Clientes ---------------------------------------------------------------------------------------
+let clientSearch = '';
+
+async function viewClients() {
+  const clients = await api('GET', '/api/clients');
+  const box = h('div');
+  const total = clients.reduce((n, c) => n + c.devices, 0);
+  const paint = () => {
+    const t = clientSearch.toLowerCase();
+    const list = clients.filter((c) => !t || `${c.extId} ${c.name} ${c.phone} ${c.taxId} ${c.email}`.toLowerCase().includes(t));
+    if (!clients.length) {
+      box.replaceChildren(h('div', { class: 'empty' }, h('h2', {}, 'Todavía no hay clientes'),
+        h('p', {}, 'Cargá a quienes les instalás los TV Box. Después asignales sus equipos para encontrarlos, avisarles o bloquearlos juntos.'),
+        canAdmin() ? h('button', { class: 'primary', onclick: () => clientDialog(null) }, 'Crear cliente') : null));
+      return;
+    }
+    box.replaceChildren(list.length ? h('div', { class: 'sheet' }, h('div', { class: 'table-wrap' }, h('table', { class: 'clients' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'ID'), h('th', {}, 'Cliente'), h('th', {}, 'Teléfono'), h('th', { class: 'num' }, 'Equipos'))),
+      h('tbody', {}, list.map((c) => h('tr', { onclick: () => openClient(c.id) },
+        h('td', { class: 'id' }, c.extId),
+        h('td', {}, h('button', { class: 'link-button', onclick: (e) => { e.stopPropagation(); openClient(c.id); } }, c.name)),
+        h('td', {}, c.phone || h('span', { class: 'hint' }, '—')),
+        h('td', { class: 'num' }, c.devices, c.blocked ? [h('br'), h('small', { class: 'err-line' }, `${c.blocked} bloqueado${c.blocked === 1 ? '' : 's'}`)] : null)))))))
+      : h('div', { class: 'empty' }, h('p', {}, 'Ningún cliente coincide con la búsqueda.')));
+  };
+  fill(
+    header('Clientes', h('span', { class: 'count' }, clients.length ? `${plural(clients.length, 'cliente', 'clientes')}, ${plural(total, 'equipo asignado', 'equipos asignados')}` : ''),
+      h('span', { class: 'spacer' }), canAdmin() && clients.length ? h('button', { class: 'primary', onclick: () => clientDialog(null) }, 'Crear cliente') : null),
+    clients.length ? h('div', { class: 'filters' }, h('input', { type: 'search', placeholder: 'Buscar por ID, nombre, teléfono o documento', 'aria-label': 'Buscar cliente', value: clientSearch, oninput: (e) => { clientSearch = e.target.value; paint(); } })) : null,
+    box);
+  paint();
+}
+
+function clientDialog(c, after) {
+  const f = {
+    extId: field('cl-id', 'ID del cliente', { value: c?.extId || '', maxlength: 40, autocomplete: 'off' }, { hint: 'El mismo que usás en tu sistema de gestión. Sirve para vincularlo por API.' }),
+    name: field('cl-n', 'Nombre completo', { value: c?.name || '', maxlength: 120, autocomplete: 'off' }),
+    taxId: field('cl-t', 'DNI, CUIT o CUIL', { value: c?.taxId || '', maxlength: 20, inputmode: 'numeric', autocomplete: 'off' }),
+    phone: field('cl-p', 'Teléfono', { type: 'tel', value: c?.phone || '', maxlength: 30, autocomplete: 'off' }),
+    address: field('cl-a', 'Domicilio', { value: c?.address || '', maxlength: 200, autocomplete: 'off' }, { span: true }),
+    email: field('cl-e', 'Email', { type: 'email', value: c?.email || '', maxlength: 120, autocomplete: 'off' }, { span: true }),
+    notes: field('cl-o', 'Notas', { value: c?.notes || '', maxlength: 500 }, { span: true, el: 'textarea' }),
+  };
+  const d = dialog(c ? `Editar ${c.name}` : 'Crear cliente', h('div', { class: 'form-grid' }, Object.values(f).map((x) => x.el)), [
+    h('button', { onclick: () => d.close() }, 'Cancelar'),
+    h('button', { class: 'primary', onclick: guard(async () => {
+      const body = Object.fromEntries(Object.entries(f).map(([k, x]) => [k, x.input.value]));
+      const r = await api(c ? 'PUT' : 'POST', c ? `/api/clients/${c.id}` : '/api/clients', body);
+      d.close();
+      toast(c ? 'Cliente guardado' : `Cliente ${r.extId} creado`);
+      if (after) await after(r); else go('clients');
+    }) }, c ? 'Guardar cliente' : 'Crear cliente'),
+  ], 'xwide');
+  f.extId.input.focus();
+}
+
+async function openClient(id) {
+  const c = await api('GET', `/api/clients/${id}`);
+  const admin = canAdmin();
+  const chosen = new Set();
+  const reopen = async () => { dlg.close(); if (current === 'clients') await viewClients(); await openClient(id); };
+  const ids = () => (chosen.size ? [...chosen] : c.deviceList.map((d) => d.id));
+  const target = () => (chosen.size ? plural(chosen.size, 'equipo elegido', 'equipos elegidos') : 'todos sus equipos');
+  const actions = h('div', { class: 'wrap-actions' });
+  const paintActions = () => actions.replaceChildren(...[
+    h('button', { class: 'primary', disabled: !c.deviceList.length, onclick: () => sendMessageDialog(ids(), reopen) }, 'Enviar mensaje'),
+    h('button', { class: 'danger', disabled: !c.deviceList.length, onclick: () => lockDialog(ids(), reopen) }, 'Bloquear'),
+    h('button', { disabled: !c.deviceList.length, onclick: guard(() => bulk(ids(), 'unlock', {}, 'Desbloqueo enviado', reopen)) }, 'Desbloquear'),
+    admin ? h('button', { onclick: () => addDevicesDialog(c, reopen) }, 'Agregar equipos') : null,
+    admin && chosen.size ? h('button', { onclick: guard(() => bulk([...chosen], 'assignClient', { clientId: null }, 'Equipos quitados del cliente', reopen)) }, 'Quitar del cliente') : null,
+    h('p', { class: 'hint' }, `Las acciones se aplican a ${target()}.`),
+  ].filter(Boolean));
+  paintActions();
+  const rows = c.deviceList.map((d) => h('tr', {},
+    h('td', {}, h('input', { type: 'checkbox', 'aria-label': `Elegir ${d.name}`, onchange: (e) => { if (e.target.checked) chosen.add(d.id); else chosen.delete(d.id); paintActions(); } })),
+    h('td', {}, h('strong', {}, d.name), h('br'), h('small', {}, d.state.model || '')),
+    h('td', {}, d.suspended ? [h('span', { class: 'dot bad' }), 'Suspendido'] : d.blocked ? [h('span', { class: 'dot bad' }), 'Bloqueado'] : d.online ? [h('span', { class: 'dot on' }), 'En línea'] : [h('span', { class: 'dot' }), `Visto ${ago(d.lastSeen)}`]),
+    h('td', {}, h('button', { class: 'plain', onclick: () => openDevice(d.id, reopen) }, 'Ver'))));
+  const facts = [['ID', c.extId], ['DNI/CUIT/CUIL', c.taxId], ['Domicilio', c.address], ['Teléfono', c.phone], ['Email', c.email], ['Notas', c.notes]];
+  const dlg = h('dialog', { class: 'drawer' },
+    h('div', { class: 'drawer-head' }, h('h2', {}, c.name), h('button', { onclick: () => dlg.close() }, 'Cerrar')),
+    h('dl', { class: 'facts' }, facts.flatMap(([k, v]) => (v ? [h('dt', {}, k), h('dd', {}, v)] : []))),
+    admin ? h('div', { class: 'wrap-actions' },
+      h('button', { onclick: () => clientDialog(c, async () => reopen()) }, 'Editar datos'),
+      h('button', { class: 'danger', onclick: () => confirmDialog(`Eliminar ${c.name}`, `Se borra el cliente. ${c.devices ? `Sus ${plural(c.devices, 'equipo', 'equipos')} siguen funcionando, sin cliente asignado.` : ''}`, 'Eliminar cliente', true, guard(async () => { await api('DELETE', `/api/clients/${c.id}`); dlg.close(); go('clients'); })) }, 'Eliminar cliente')) : null,
+    h('h3', {}, `Equipos (${c.deviceList.length})`, c.online ? `, ${c.online} en línea` : ''),
+    c.deviceList.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'devices' }, h('tbody', {}, rows))) : h('p', { class: 'hint' }, admin ? 'Este cliente no tiene equipos. Agregalos acá, desde Pantallas o al crear un token de alta.' : 'Este cliente no tiene equipos asignados.'),
+    actions);
+  dlg.addEventListener('close', () => dlg.remove());
+  document.body.append(dlg);
+  dlg.showModal();
+}
+
+async function addDevicesDialog(c, after) {
+  const all = await api('GET', '/api/devices');
+  const others = all.filter((d) => d.clientId !== c.id);
+  if (!others.length) return toast('Todos los equipos ya son de este cliente', true);
+  const pick = new Set();
+  const search = h('input', { type: 'search', placeholder: 'Buscar equipo', 'aria-label': 'Buscar equipo' });
+  const list = h('div', { class: 'pick-list' });
+  const paint = () => {
+    const t = search.value.toLowerCase();
+    list.replaceChildren(...others.filter((d) => !t || `${d.name} ${d.group} ${d.state.model || ''} ${d.clientName}`.toLowerCase().includes(t)).map((d) => h('label', { class: 'check' },
+      h('input', { type: 'checkbox', checked: pick.has(d.id), onchange: (e) => { if (e.target.checked) pick.add(d.id); else pick.delete(d.id); } }),
+      h('span', {}, d.name, ' ', h('small', {}, d.clientId ? `ahora de ${d.clientName}` : 'sin cliente', d.group ? `, grupo ${d.group}` : '')))));
+  };
+  search.addEventListener('input', paint);
+  paint();
+  const d = dialog(`Agregar equipos a ${c.name}`, h('div', {}, search, list), [
+    h('button', { onclick: () => d.close() }, 'Cancelar'),
+    h('button', { class: 'primary', onclick: guard(async () => {
+      if (!pick.size) throw new Error('Elegí al menos un equipo');
+      await bulk([...pick], 'assignClient', { clientId: c.id }, 'Equipos agregados');
+      d.close();
+      await after();
+    }) }, 'Agregar equipos'),
+  ], 'wide');
+  search.focus();
 }
 
 // ---- Empresas (administrador general) ------------------------------------------------------------
@@ -814,7 +1184,9 @@ async function viewCompanies() {
   const [companies, settings] = await Promise.all([api('GET', '/api/companies'), api('GET', '/api/settings')]);
   const total = companies.reduce((n, c) => n + c.monthDevices, 0);
   const rows = companies.map((c) => h('tr', {},
-    h('td', {}, h('strong', {}, c.name), c.notes ? [h('br'), h('small', {}, c.notes)] : null),
+    h('td', {}, h('strong', {}, c.name),
+      c.legalName ? [h('br'), h('small', {}, `${c.legalName}${c.taxId ? `, ${c.taxId}` : ''}`)] : [h('br'), h('small', { class: 'err-line' }, 'Faltan los datos fiscales')],
+      c.notes ? [h('br'), h('small', { class: 'hint' }, c.notes)] : null),
     h('td', {}, companyState(c)),
     h('td', { class: 'num' }, c.devices), h('td', { class: 'num' }, c.online), h('td', { class: 'num' }, c.monthDevices),
     h('td', {}, c.admins.join(', ') || h('span', { class: 'hint' }, 'Sin administrador')),
@@ -837,40 +1209,43 @@ async function viewCompanies() {
 }
 
 function newCompany() {
-  const name = h('input', { type: 'text', id: 'nc-n', maxlength: 60 });
-  const user = h('input', { type: 'text', id: 'nc-u', maxlength: 40, autocomplete: 'off' });
-  const pass = h('input', { type: 'password', id: 'nc-p', autocomplete: 'new-password' });
-  const d = dialog('Crear empresa', h('div', {},
-    h('label', { for: 'nc-n' }, 'Nombre de la empresa'), name,
+  const co = companyFields();
+  const user = field('nc-u', 'Nombre de usuario', { maxlength: 40, autocomplete: 'off' });
+  const pw = passwordField('nc-p', 'Clave');
+  const data = userFields('nc', {}, { emailRequired: false, emailHint: 'Vacío: el email de contacto de la empresa. Con él recupera la clave.' });
+  const d = dialog('Crear empresa', h('div', { class: 'form-grid' },
+    h('h3', {}, 'Empresa'), co.els,
     h('h3', {}, 'Administrador de la empresa'),
-    h('label', { for: 'nc-u' }, 'Usuario'), user,
-    h('label', { for: 'nc-p' }, 'Clave (10 caracteres o más)'), pass,
-    h('p', { class: 'hint' }, 'Podés dejarlo vacío y crearlo después desde Usuarios, administrando la empresa.')), [
+    user.el, h('div'),
+    h('div', { class: 'span2' }, pw.el),
+    data.els,
+    h('p', { class: 'hint span2' }, 'Si dejás vacío el usuario, la empresa se crea sin administrador y lo agregás después desde Usuarios, administrando la empresa.')), [
     h('button', { onclick: () => d.close() }, 'Cancelar'),
     h('button', { class: 'primary', onclick: guard(async () => {
-      await api('POST', '/api/companies', { name: name.value, adminUser: user.value || undefined, adminPassword: pass.value });
+      const c = co.values();
+      const admin = user.input.value.trim() ? { username: user.input.value, password: pw.input.value, ...data.values() } : undefined;
+      await api('POST', '/api/companies', { ...c, admin });
       d.close();
-      toast(`${name.value} creada`);
+      toast(`${c.name} creada`);
       go('companies');
     }) }, 'Crear empresa'),
-  ]);
-  name.focus();
+  ], 'xwide');
+  co.focus();
 }
 
 function editCompany(c) {
-  const name = h('input', { type: 'text', id: 'ec-n', maxlength: 60, value: c.name });
+  const co = companyFields(c);
   const notes = h('textarea', { id: 'ec-o', maxlength: 500, value: c.notes });
-  const d = dialog(`Editar ${c.name}`, h('div', {},
-    h('label', { for: 'ec-n' }, 'Nombre'), name,
-    h('p', { class: 'hint' }, 'Es el nombre que ven la empresa en su panel y sus clientes en los TV Box.'),
-    h('label', { for: 'ec-o' }, 'Notas internas'), notes), [
+  const d = dialog(`Editar ${c.name}`, h('div', { class: 'form-grid' }, co.els,
+    h('div', { class: 'span2' }, h('label', { for: 'ec-o' }, 'Notas internas'), notes, h('p', { class: 'hint' }, 'Solo las ven los administradores generales.'))), [
     h('button', { onclick: () => d.close() }, 'Cancelar'),
     h('button', { class: 'primary', onclick: guard(async () => {
-      await api('PATCH', `/api/companies/${c.id}`, { name: name.value, notes: notes.value });
+      await api('PATCH', `/api/companies/${c.id}`, { ...co.values(), notes: notes.value });
       d.close();
+      toast('Empresa guardada');
       go('companies');
     }) }, 'Guardar cambios'),
-  ]);
+  ], 'xwide');
 }
 
 // ---- Facturación ----------------------------------------------------------------------------------
@@ -893,10 +1268,11 @@ async function viewBilling() {
     h('p', {}, 'Se factura todo equipo que estuvo registrado al menos un día del mes, aunque después se haya dado de baja. ',
       r.closed ? 'Este mes ya cerró y su número no cambia.' : 'Este número puede subir hasta que termine el mes.'),
     h('div', { class: 'sheet' }, h('div', { class: 'table-wrap' }, h('table', {},
-      h('thead', {}, h('tr', {}, h('th', {}, 'Empresa'), h('th', {}, 'Estado'), h('th', { class: 'num' }, 'Equipos facturables'), h('th', {}, ''))),
-      h('tbody', {}, r.rows.map((x) => h('tr', {}, h('td', {}, x.name), h('td', {}, statusText[x.status] || x.status), h('td', { class: 'num' }, x.devices),
+      h('thead', {}, h('tr', {}, h('th', {}, 'Empresa'), h('th', {}, 'Datos fiscales'), h('th', {}, 'Estado'), h('th', { class: 'num' }, 'Equipos facturables'), h('th', {}, ''))),
+      h('tbody', {}, r.rows.map((x) => h('tr', {}, h('td', {}, x.name), h('td', {}, x.legalName ? [x.legalName, h('br'), h('small', {}, [x.taxId, x.taxCondition].filter(Boolean).join(', '))] : h('span', { class: 'hint' }, 'Sin cargar')),
+        h('td', {}, statusText[x.status] || x.status), h('td', { class: 'num' }, x.devices),
         h('td', {}, x.devices ? h('a', { href: `/api/billing/${x.companyId}/devices.csv?month=${r.month}`, download: '' }, 'Detalle por equipo') : null))),
-      h('tr', { class: 'total' }, h('td', {}, 'Total'), h('td', {}), h('td', { class: 'num' }, r.total), h('td', {})))))));
+      h('tr', { class: 'total' }, h('td', {}, 'Total'), h('td', {}), h('td', {}), h('td', { class: 'num' }, r.total), h('td', {})))))));
 }
 
 // ---- Configuración general ------------------------------------------------------------------------
@@ -935,8 +1311,40 @@ async function viewSettings() {
         gsecret.value = '';
         toast('Aplicación de Google guardada');
       }) }, 'Guardar aplicación de Google'))),
+    mailSheet(settings),
     usersSheet(users, [['superadmin', 'Administrador general']], 'Administradores generales', 'Pueden ver y administrar todas las empresas.'),
     h('div', { class: 'sheet' }, h('h2', {}, 'Actividad general'), auditTable(audit)));
+}
+
+/** Correo saliente: lo usa la recuperación de claves. */
+function mailSheet(st) {
+  const host = field('m-h', 'Servidor SMTP', { value: st.smtpHost, placeholder: 'smtp.gmail.com', autocomplete: 'off' });
+  const port = field('m-p', 'Puerto', { type: 'number', min: 1, max: 65535, value: st.smtpPort || 587 });
+  const sec = h('select', { id: 'm-s' }, [['starttls', 'STARTTLS (puerto 587)'], ['tls', 'TLS directo (puerto 465)']].map(([v, t]) => h('option', { value: v, selected: st.smtpSecurity === v }, t)));
+  sec.addEventListener('change', () => { port.input.value = sec.value === 'tls' ? 465 : 587; });
+  const user = field('m-u', 'Usuario', { value: st.smtpUser, autocomplete: 'off' });
+  const pass = field('m-pw', 'Contraseña', { type: 'password', autocomplete: 'new-password', placeholder: st.smtpPassSet ? 'Guardada. Dejala vacía para no cambiarla' : '' });
+  const from = field('m-f', 'Remitente', { value: st.smtpFrom, placeholder: 'WiFly MDM <avisos@miempresa.com>' }, { span: true, hint: 'Conviene que sea una dirección del mismo dominio que la cuenta SMTP, para que no caiga en spam.' });
+  const values = () => ({ smtpHost: host.input.value, smtpPort: Number(port.input.value), smtpSecurity: sec.value, smtpUser: user.input.value, smtpPass: pass.input.value, smtpFrom: from.input.value });
+  return h('div', { class: 'sheet' }, h('h2', {}, 'Correo saliente'),
+    h('p', {}, 'Con esto, cualquier usuario del panel puede recuperar su clave por email desde "Olvidé mi clave". Sirve una cuenta de correo de tu dominio o de Gmail con una contraseña de aplicación.'),
+    st.mailReady ? null : h('div', { class: 'note' }, 'Sin configurar: la recuperación de claves por email no funciona. Mientras tanto, un administrador puede cambiar la clave de otro usuario desde Usuarios.'),
+    h('div', { class: 'form-grid' },
+      host.el, h('div', {}, h('label', { for: 'm-s' }, 'Seguridad'), sec),
+      port.el, h('div'),
+      user.el, pass.el, from.el),
+    h('div', { class: 'save-bar' },
+      h('button', { class: 'primary', onclick: guard(async () => {
+        const g = await api('GET', '/api/settings');
+        await api('PUT', '/api/settings', { brandPhrase: g.brandPhrase, graceDays: g.graceDays, ...values() });
+        pass.input.value = '';
+        toast('Correo saliente guardado');
+      }) }, 'Guardar correo'),
+      h('button', { onclick: guard(async () => {
+        toast('Enviando prueba…');
+        const r = await api('POST', '/api/settings/mail-test', {});
+        toast(`Correo de prueba enviado a ${r.to}`);
+      }) }, me.email ? `Enviar prueba a ${me.email}` : 'Enviar prueba')));
 }
 
 // ---- Actualizaciones desde GitHub ------------------------------------------------------------------

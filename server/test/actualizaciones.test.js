@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createApp } from '../src/app.js';
+import { empresa, usuario } from './datos.js';
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wifly-upd-'));
 const upd = path.join(dir, 'updater');
@@ -17,7 +18,7 @@ const call = async (method, url, body) => {
 };
 
 before(async () => {
-  ctx = createApp({ dataDir: dir, adminPassword: 'clave-de-prueba-1', updaterDir: upd, billingIntervalMs: 0 });
+  ctx = createApp({ dataDir: dir, adminPassword: 'Clave-de-prueba-1', updaterDir: upd, billingIntervalMs: 0 });
   await new Promise((ok) => { srv = ctx.app.listen(0, ok); });
   base = `http://127.0.0.1:${srv.address().port}`;
 });
@@ -30,7 +31,7 @@ test('el chequeo de salud informa la versión sin pedir sesión', async () => {
 });
 
 test('sin activar en el CT, el panel lo dice y no deja pedir nada', async () => {
-  await call('POST', '/api/login', { username: 'admin', password: 'clave-de-prueba-1' });
+  await call('POST', '/api/login', { username: 'admin', password: 'Clave-de-prueba-1' });
   const s = (await call('GET', '/api/updates')).body;
   assert.equal(s.enabled, false);
   assert.equal(s.current, `v${ctx.version}`);
@@ -57,10 +58,10 @@ test('con el actualizador activo: buscar y actualizar dejan el pedido para el CT
 });
 
 test('solo el administrador general puede actualizar', async () => {
-  const c = await call('POST', '/api/companies', { name: 'Cliente', adminUser: 'admin.cliente', adminPassword: 'clave-cli-123' });
+  const c = await call('POST', '/api/companies', empresa('Cliente', 'admin.cliente', 'Clave-cli-123'));
   assert.equal(c.status, 200);
   cookie = '';
-  await call('POST', '/api/login', { username: 'admin.cliente', password: 'clave-cli-123' });
+  await call('POST', '/api/login', { username: 'admin.cliente', password: 'Clave-cli-123' });
   assert.equal((await call('GET', '/api/updates')).status, 403);
   assert.equal((await call('POST', '/api/updates/apply', { version: 'v9.0.0' })).status, 403);
 });

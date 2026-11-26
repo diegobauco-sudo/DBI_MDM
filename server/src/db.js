@@ -22,6 +22,8 @@ export function openDb(dataDir) {
   // Esquema 3: respaldos. Se agrega igual sobre bases nuevas y migradas.
   db.exec(BACKUP_TABLES);
   if (db.prepare('PRAGMA user_version').get().user_version < 3) db.exec('PRAGMA user_version = 3');
+  // Esquema 4: datos fiscales de la empresa, datos de contacto de los usuarios, clientes y recuperación de clave.
+  migrateV4(db);
   db.exec('PRAGMA foreign_keys = ON;');
   return db;
 }
@@ -35,6 +37,40 @@ const BACKUP_TABLES = `
   );
   CREATE INDEX IF NOT EXISTS backup_runs_key ON backup_runs(key, id);
 `;
+
+/** Agrega una columna solo si falta: sirve igual para bases nuevas, migradas desde la v1 o ya en esquema 3. */
+function addColumns(db, table, defs) {
+  const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name));
+  for (const [name, def] of defs) if (!have.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${def}`);
+}
+
+function migrateV4(db) {
+  db.exec('BEGIN');
+  try {
+    const text = "TEXT NOT NULL DEFAULT ''";
+    addColumns(db, 'companies', [['legal_name', text], ['tax_address', text], ['tax_condition', text], ['tax_id', text], ['email', text], ['phone', text]]);
+    addColumns(db, 'users', [['full_name', text], ['display_name', text], ['phone', text], ['email', text]]);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS clients (
+        id INTEGER PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+        ext_id TEXT NOT NULL, name TEXT NOT NULL, tax_id TEXT NOT NULL DEFAULT '', address TEXT NOT NULL DEFAULT '',
+        phone TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, UNIQUE (company_id, ext_id)
+      );
+      CREATE TABLE IF NOT EXISTS password_resets (
+        token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL
+      );
+    `);
+    addColumns(db, 'devices', [['client_id', 'INTEGER REFERENCES clients(id) ON DELETE SET NULL']]);
+    addColumns(db, 'enroll_tokens', [['client_id', 'INTEGER REFERENCES clients(id) ON DELETE SET NULL']]);
+    db.exec('CREATE INDEX IF NOT EXISTS devices_client ON devices(client_id)');
+    if (db.prepare('PRAGMA user_version').get().user_version < 4) db.exec('PRAGMA user_version = 4');
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
+}
 
 const V2_TABLES = `
   CREATE TABLE IF NOT EXISTS companies (

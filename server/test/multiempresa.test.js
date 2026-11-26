@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createApp } from '../src/app.js';
+import { empresa, usuario } from './datos.js';
 
 // Reloj controlable para probar cierres de mes y días de gracia.
 let fakeNow = Date.parse('2026-10-15T15:00:00Z');
@@ -52,20 +53,20 @@ let A, B, tokA, tokB, devA, devB;
 
 test('el administrador general crea empresas con su administrador', async () => {
   assert.equal((await sup.login('admin', 'super-clave-123')).status, 200);
-  const a = await sup.call('POST', '/api/companies', { name: 'Hotel Sur', adminUser: 'admin.sur', adminPassword: 'clave-sur-123' });
-  const b = await sup.call('POST', '/api/companies', { name: 'Bar Centro', adminUser: 'admin.bar', adminPassword: 'clave-bar-123' });
+  const a = await sup.call('POST', '/api/companies', empresa('Hotel Sur', 'admin.sur', 'Clave-sur-123'));
+  const b = await sup.call('POST', '/api/companies', empresa('Bar Centro', 'admin.bar', 'Clave-bar-123'));
   assert.equal(a.status, 200);
   assert.equal(b.status, 200);
   A = a.body.id; B = b.body.id;
   assert.deepEqual(a.body.admins, ['admin.sur']);
   assert.equal((await sup.call('POST', '/api/companies', { name: 'Hotel Sur' })).status, 409, 'nombre repetido');
-  assert.equal((await sup.call('POST', '/api/companies', { name: 'X', adminUser: 'admin.sur', adminPassword: 'clave-x-1234' })).status, 409, 'usuario repetido');
+  assert.equal((await sup.call('POST', '/api/companies', empresa('X', 'admin.sur', 'Clave-x-1234'))).status, 409, 'usuario repetido');
   assert.equal((await sup.call('GET', '/api/companies')).body.length, 2, 'la empresa con usuario repetido no quedó a medias');
 });
 
 test('cada administrador de empresa entra directo a su empresa', async () => {
-  assert.equal((await adminA.login('admin.sur', 'clave-sur-123')).status, 200);
-  assert.equal((await adminB.login('admin.bar', 'clave-bar-123')).status, 200);
+  assert.equal((await adminA.login('admin.sur', 'Clave-sur-123')).status, 200);
+  assert.equal((await adminB.login('admin.bar', 'Clave-bar-123')).status, 200);
   const me = (await adminA.call('GET', '/api/me')).body;
   assert.equal(me.role, 'admin');
   assert.equal(me.company.name, 'Hotel Sur');
@@ -101,8 +102,8 @@ test('el mismo archivo subido por dos empresas queda separado', async () => {
     const r = await fetch(`${base}/api/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: u, password: p }) });
     return r.headers.get('set-cookie').split(';')[0];
   };
-  const ca = await loginCookie('admin.sur', 'clave-sur-123');
-  const cb = await loginCookie('admin.bar', 'clave-bar-123');
+  const ca = await loginCookie('admin.sur', 'Clave-sur-123');
+  const cb = await loginCookie('admin.bar', 'Clave-bar-123');
   const post = async (cookie, name) => {
     const form = new FormData();
     form.set('kind', 'image');
@@ -126,10 +127,10 @@ test('el mismo archivo subido por dos empresas queda separado', async () => {
 });
 
 test('el operador solo envía mensajes, bloquea y desbloquea', async () => {
-  assert.equal((await adminA.call('POST', '/api/users', { username: 'op.sur', password: 'clave-op-123', role: 'operator' })).status, 200);
-  assert.equal((await adminA.call('POST', '/api/users', { username: 'otro.admin', password: 'clave-ad-123', role: 'admin' })).status, 403, 'un administrador no crea administradores');
-  assert.equal((await adminA.call('POST', '/api/users', { username: 'nuevo.super', password: 'clave-su-123', role: 'superadmin' })).status, 403);
-  assert.equal((await opA.login('op.sur', 'clave-op-123')).status, 200);
+  assert.equal((await adminA.call('POST', '/api/users', { ...usuario('op.sur', 'Clave-op-123'), role: 'operator' })).status, 200);
+  assert.equal((await adminA.call('POST', '/api/users', { ...usuario('otro.admin', 'Clave-ad-123'), role: 'admin' })).status, 403, 'un administrador no crea administradores');
+  assert.equal((await adminA.call('POST', '/api/users', { ...usuario('nuevo.super', 'Clave-su-123'), role: 'superadmin' })).status, 403);
+  assert.equal((await opA.login('op.sur', 'Clave-op-123')).status, 200);
   assert.equal((await opA.call('GET', '/api/devices')).status, 200);
   for (const action of ['message', 'lock', 'unlock']) {
     const r = await opA.call('POST', '/api/devices/bulk', { ids: [devA.deviceId], action, payload: { body: 'Hola' } });
@@ -150,7 +151,7 @@ test('el administrador general administra una empresa eligiéndola', async () =>
   assert.equal((await sup.call('GET', '/api/devices')).status, 409);
   await sup.call('POST', '/api/context', { companyId: B });
   assert.equal((await sup.call('GET', '/api/devices')).body.length, 3);
-  assert.equal((await sup.call('POST', '/api/users', { username: 'admin2.bar', password: 'clave-ad2-123', role: 'admin' })).status, 200);
+  assert.equal((await sup.call('POST', '/api/users', { ...usuario('admin2.bar', 'Clave-ad2-123'), role: 'admin' })).status, 200);
   await sup.call('POST', '/api/context', { companyId: null });
   assert.deepEqual((await sup.call('GET', '/api/users')).body.map((u) => u.username), ['admin'], 'sin empresa: los administradores generales');
 });
@@ -172,7 +173,7 @@ test('suspender: el panel se corta ya y los TV Box al vencer la gracia; pagar re
   assert.equal(s.body.devicesSuspended, false);
   assert.equal((await adminA.call('GET', '/api/devices')).status, 401, 'sus sesiones abiertas se cierran');
   assert.equal((await opA.call('GET', '/api/devices')).status, 401);
-  const again = await client().login('admin.sur', 'clave-sur-123');
+  const again = await client().login('admin.sur', 'Clave-sur-123');
   assert.equal(again.status, 403, 'no puede volver a entrar');
   assert.equal(again.body.code, 'suspended');
   assert.match(again.body.error, /suspendida/);
@@ -196,7 +197,7 @@ test('suspender: el panel se corta ya y los TV Box al vencer la gracia; pagar re
   assert.equal((await sup.call('POST', `/api/companies/${A}/activate`)).body.status, 'active');
   cfg = (await dev(devA.deviceToken, 'GET', '/api/device/config')).body;
   assert.equal(cfg.blocked, false);
-  assert.equal((await adminA.login('admin.sur', 'clave-sur-123')).status, 200);
+  assert.equal((await adminA.login('admin.sur', 'Clave-sur-123')).status, 200);
   assert.equal((await adminA.call('GET', '/api/devices')).status, 200);
 });
 
@@ -204,7 +205,7 @@ test('facturación: cuenta todo equipo registrado algún día del mes y cierra e
   // Octubre: A tiene 1 equipo, B tiene 3. Se anota el día y se borra uno de B a mitad de mes.
   fakeNow = Date.parse('2026-10-20T15:00:00Z');
   ctx.tick();
-  await adminB.login('admin.bar', 'clave-bar-123');
+  await adminB.login('admin.bar', 'Clave-bar-123');
   const bDevices = (await adminB.call('GET', '/api/devices')).body;
   assert.equal((await adminB.call('DELETE', `/api/devices/${bDevices[0].id}`)).status, 200);
   let r = (await sup.call('GET', '/api/billing?month=2026-10')).body;
@@ -217,8 +218,8 @@ test('facturación: cuenta todo equipo registrado algún día del mes y cierra e
   fakeNow = Date.parse('2026-11-02T15:00:00Z');
   ctx.tick();
   await sup.login('admin', 'super-clave-123');
-  await adminA.login('admin.sur', 'clave-sur-123');
-  await adminB.login('admin.bar', 'clave-bar-123');
+  await adminA.login('admin.sur', 'Clave-sur-123');
+  await adminB.login('admin.bar', 'Clave-bar-123');
   await enroll(tokB, 'equipo-b-0010');
   r = (await sup.call('GET', '/api/billing?month=2026-10')).body;
   assert.equal(r.closed, true);
@@ -230,16 +231,16 @@ test('facturación: cuenta todo equipo registrado algún día del mes y cierra e
 
   const csv = await sup.call('GET', '/api/billing.csv?month=2026-10');
   assert.equal(csv.status, 200);
-  assert.ok(csv.text.startsWith('﻿Mes;Empresa;Estado;Equipos facturables'));
-  assert.match(csv.text, /2026-10;Bar Centro;Activa;3;Sí/);
-  assert.match(csv.text, /TOTAL;;4/);
+  assert.ok(csv.text.startsWith('﻿Mes;Empresa;Razón social;CUIT/DNI;Tipo de impuesto;Estado;Equipos facturables'));
+  assert.match(csv.text, /2026-10;Bar Centro;Bar Centro S\.A\.;30-71234567-1;Responsable inscripto;Activa;3;Sí/);
+  assert.match(csv.text, /TOTAL;;;;;4/);
   const detail = await sup.call('GET', `/api/billing/${B}/devices.csv?month=2026-10`);
   assert.equal(detail.text.trim().split('\r\n').length, 4, 'encabezado + 3 equipos');
 });
 
 test('una empresa con equipos no se puede eliminar', async () => {
   assert.equal((await sup.call('DELETE', `/api/companies/${B}`)).status, 409);
-  const e = await sup.call('POST', '/api/companies', { name: 'Vacía' });
+  const e = await sup.call('POST', '/api/companies', empresa('Vacía'));
   assert.equal((await sup.call('DELETE', `/api/companies/${e.body.id}`)).status, 200);
 });
 

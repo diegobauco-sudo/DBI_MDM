@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import { fakeGoogle } from './google-falso.js';
+import { empresa, usuario } from './datos.js';
 
 // SFTP y FTPS reales si hay servidores de prueba levantados (ver test/README); si no, esas partes se saltan.
 const portOpen = (port) => new Promise((ok) => { const s = net.connect(port, '127.0.0.1', () => { s.end(); ok(true); }).on('error', () => ok(false)); });
@@ -62,11 +63,11 @@ let A, B, devA, driveId;
 
 test('preparación: dos empresas con equipos', async () => {
   await sup.login('admin', 'super-clave-123');
-  A = (await sup.call('POST', '/api/companies', { name: 'Hotel Sur', adminUser: 'admin.sur', adminPassword: 'clave-sur-123' })).body.id;
-  B = (await sup.call('POST', '/api/companies', { name: 'Bar Centro', adminUser: 'admin.bar', adminPassword: 'clave-bar-123' })).body.id;
-  await adm.login('admin.sur', 'clave-sur-123');
-  await adm.call('POST', '/api/users', { username: 'op.sur', password: 'clave-op-1234', role: 'operator' });
-  await op.login('op.sur', 'clave-op-1234');
+  A = (await sup.call('POST', '/api/companies', empresa('Hotel Sur', 'admin.sur', 'Clave-sur-123'))).body.id;
+  B = (await sup.call('POST', '/api/companies', empresa('Bar Centro', 'admin.bar', 'Clave-bar-123'))).body.id;
+  await adm.login('admin.sur', 'Clave-sur-123');
+  await adm.call('POST', '/api/users', { ...usuario('op.sur', 'Clave-op-1234'), role: 'operator' });
+  await op.login('op.sur', 'Clave-op-1234');
   const tok = (await adm.call('POST', '/api/enroll-tokens', { label: 'lote' })).body.token;
   const e = await (await fetch(`${base}/api/device/enroll`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: tok, installId: 'equipo-sur-0001', model: 'Q5' }) })).json();
   devA = e;
@@ -207,7 +208,7 @@ test('restaurar una empresa: vuelve a como estaba sin tocar a la otra', async ()
   assert.deepEqual(r.body.skipped, []);
 
   // El administrador se recrea en la restauración: vuelve a entrar con su misma clave.
-  await adm.login('admin.sur', 'clave-sur-123');
+  await adm.login('admin.sur', 'Clave-sur-123');
   const p = (await adm.call('GET', '/api/profiles')).body[0];
   assert.equal(p.title, 'Hotel Sur original');
   assert.equal((await adm.call('GET', '/api/devices')).body.length, 1);
@@ -217,7 +218,7 @@ test('restaurar una empresa: vuelve a como estaba sin tocar a la otra', async ()
 
 test('un respaldo de una empresa no se puede restaurar en otra', async () => {
   const c = client();
-  await c.login('admin.bar', 'clave-bar-123');
+  await c.login('admin.bar', 'Clave-bar-123');
   await c.call('PUT', '/api/backups/empresa', { frequency: 'manual', hour: 0, keep: 5, password: 'cifrado-bar-123', destinations: [] });
   // Bar Centro sube el archivo de Hotel Sur desde la PC.
   const file = path.join(dir, 'ajeno.wfbk');
@@ -261,7 +262,7 @@ test('restaurar el sistema completo: se aplica al reiniciar y deja copia del est
   const remote = (await sup.call('GET', '/api/backups/general/remote')).body.find((d) => d.type === 'gdrive');
   const name = remote.items[0].name;
   // Después del respaldo: una empresa nueva que el respaldo no tiene.
-  await sup.call('POST', '/api/companies', { name: 'Empresa posterior' });
+  await sup.call('POST', '/api/companies', empresa('Empresa posterior'));
   const r = await sup.call('POST', '/api/backups/general/restore', { destId: remote.destId, name, password: 'cifrado-general-1' });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.equal(r.body.restart, true);

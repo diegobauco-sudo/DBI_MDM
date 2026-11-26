@@ -10,6 +10,8 @@ import { createBilling } from './billing.js';
 import { createUpdates } from './updates.js';
 import { createBackups, BackupError } from './backup/service.js';
 import { randomToken, sha256, hashAdminPassword, verifyAdminPassword, hashExitPassword, rateLimiter } from './security.js';
+import { checkPassword, cleanTaxId, cleanEmail, cleanPhone, cleanText, TAX_CONDITIONS } from './validate.js';
+import { createMailer } from './mail.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = JSON.parse(fs.readFileSync(path.join(here, '..', 'package.json'), 'utf8')).version;
@@ -30,7 +32,7 @@ const BULK_COMMANDS = new Set(['message', 'reboot', 'sync', 'install', 'uninstal
 const OPERATOR_ACTIONS = new Set(['message', 'lock', 'unlock']);
 const ROLE_LABEL = { superadmin: 'administrador general', admin: 'administrador', operator: 'operador' };
 
-const ACTION_LABEL = { message: 'mensaje', lock: 'bloqueo', unlock: 'desbloqueo', assignProfile: 'cambio de perfil', reboot: 'reinicio', sync: 'sincronización', install: 'instalar app', uninstall: 'desinstalar app', exitKiosk: 'salir del kiosko', enterKiosk: 'activar kiosko', decommission: 'baja' };
+const ACTION_LABEL = { assignClient: 'cambio de cliente', message: 'mensaje', lock: 'bloqueo', unlock: 'desbloqueo', assignProfile: 'cambio de perfil', reboot: 'reinicio', sync: 'sincronización', install: 'instalar app', uninstall: 'desinstalar app', exitKiosk: 'salir del kiosko', enterKiosk: 'activar kiosko', decommission: 'baja' };
 
 /** El título vacío muestra el nombre de la empresa en el TV Box. */
 const DEFAULT_PROFILE = {
@@ -38,18 +40,33 @@ const DEFAULT_PROFILE = {
   wallpaperSha: '', launcherApkSha: '', apps: [], removePackages: [], helpers: [], exit: null,
 };
 
-const DEFAULT_SETTINGS = { brandPhrase: '', graceDays: '7', timezone: 'America/Argentina/Buenos_Aires', googleClientId: '', googleClientSecret: '' };
+const DEFAULT_SETTINGS = {
+  brandPhrase: '', graceDays: '7', timezone: 'America/Argentina/Buenos_Aires', googleClientId: '', googleClientSecret: '',
+  smtpHost: '', smtpPort: '587', smtpSecurity: 'starttls', smtpUser: '', smtpPass: '', smtpFrom: '',
+};
+const RESET_MS = 60 * 60_000;
 
 class HttpError extends Error {
   constructor(status, message, code) { super(message); this.status = status; this.code = code; }
 }
+/** Las validaciones lanzan Error común: acá se convierten en un 400 con el mismo mensaje. */
+const valid = (fn) => {
+  try {
+    return fn();
+  } catch (e) {
+    throw new HttpError(400, e.message);
+  }
+};
+
+/** Express 4 no atrapa errores de funciones async: esto los manda al manejador común. */
+const aw = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch((e) => next(e instanceof BackupError ? new HttpError(e.status, e.message) : e));
 
 const USERNAME_RE = /^[A-Za-z0-9._@-]{3,40}$/;
 
 export function createApp({
   dataDir, adminUser = 'admin', adminPassword, secureCookies = false, trustProxy = false,
   longPollMs = 25_000, maxUploadMb = 1024, clock = Date.now, billingIntervalMs = 10 * 60_000, updaterDir = '/updater',
-  publicUrl = '', onRestart = () => setTimeout(() => process.exit(0), 800),
+  publicUrl = '', onRestart = () => setTimeout(() => process.exit(0), 800), mailTransport = null,
 }) {
   const db = openDb(dataDir);
   const filesDir = path.join(dataDir, 'files');
@@ -64,6 +81,7 @@ export function createApp({
   const graceMs = () => Number(getSetting('graceDays')) * DAY_MS;
   const billing = createBilling(db, { now, timezone: () => getSetting('timezone') });
   const updates = createUpdates({ dir: updaterDir, version: VERSION, now });
+  const mailer = createMailer({ getSetting, transport: mailTransport });
 
   // ---- Datos iniciales ------------------------------------------------------------------
   let generatedPassword = null;
@@ -193,18 +211,19 @@ export function createApp({
     if (existing && existing.company_id === t.company_id) {
       ({ id, name } = existing);
       q('UPDATE devices SET token_hash=?, state=?, last_seen=? WHERE id=?').run(sha256(deviceToken), state, now(), id);
+      if (t.client_id) q('UPDATE devices SET client_id=? WHERE id=?').run(t.client_id, id);
     } else if (existing) {
       // El equipo pasa a otra empresa: arranca limpio con el perfil y grupo del token nuevo.
       ({ id, name } = existing);
       q(`UPDATE devices SET company_id=?, token_hash=?, state=?, last_seen=?, profile_id=?, grp=?, notes='', blocked=0, block_title='', block_message='',
-           app_overrides='{"add":[],"remove":[]}' WHERE id=?`).run(t.company_id, sha256(deviceToken), state, now(), profile, t.grp, id);
+           app_overrides='{"add":[],"remove":[]}', client_id=? WHERE id=?`).run(t.company_id, sha256(deviceToken), state, now(), profile, t.grp, t.client_id ?? null, id);
       q('DELETE FROM commands WHERE device_id=?').run(id);
       audit(existing.company_id, 'equipo', 'pasó a otra empresa', name);
     } else {
       id = crypto.randomUUID();
       name = `${String(model).slice(0, 40) || 'TV Box'} ${id.slice(0, 4)}`;
-      q(`INSERT INTO devices (id, company_id, token_hash, install_id, name, grp, profile_id, state, last_seen, created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`).run(id, t.company_id, sha256(deviceToken), installId, name, t.grp, profile, state, now(), now());
+      q(`INSERT INTO devices (id, company_id, token_hash, install_id, name, grp, profile_id, state, last_seen, created_at, client_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(id, t.company_id, sha256(deviceToken), installId, name, t.grp, profile, state, now(), now(), t.client_id ?? null);
     }
     q('UPDATE enroll_tokens SET uses = uses + 1 WHERE token = ?').run(token);
     billing.recordDevice(t.company_id, id, name);
@@ -311,13 +330,75 @@ export function createApp({
     q('INSERT INTO sessions (token_hash, user_id, company_id, expires_at) VALUES (?,?,?,?)').run(sha256(token), u.id, u.company_id, now() + SESSION_MS);
     setCookie(res, token, SESSION_MS / 1000);
     audit(u.company_id, u.username, 'ingreso');
-    res.json({ username: u.username, role: u.role });
+    res.json({ username: u.username, role: u.role, displayName: u.display_name || u.full_name || u.username });
+  });
+
+  // ---- Recuperación de clave por email ----------------------------------------------------
+  const forgotLimiter = rateLimiter({ max: 5, windowMs: 15 * 60_000 });
+  const baseUrl = (req) => (publicUrl || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
+  /** El email de recuperación: el del usuario o, para el administrador de una empresa que no cargó el suyo, el de la empresa. */
+  const recoveryEmail = (u) => u.email || (u.role === 'admin' ? companyById(u.company_id)?.email || '' : '');
+
+  app.post('/api/password/forgot', (req, res) => {
+    if (forgotLimiter.blocked(req.ip)) throw new HttpError(429, 'Demasiados intentos. Esperá 15 minutos.');
+    forgotLimiter.hit(req.ip);
+    const login = String(req.body?.login || '').trim().toLowerCase().slice(0, 120);
+    if (!login) throw new HttpError(400, 'Escribí tu usuario o tu email');
+    if (!mailer.ready()) throw new HttpError(503, 'La recuperación por email no está configurada. Pedile a un administrador que te cambie la clave.');
+    const users = q(`SELECT u.* FROM users u LEFT JOIN companies c ON c.id = u.company_id
+                     WHERE lower(u.username) = ? OR lower(u.email) = ? OR (u.role = 'admin' AND u.email = '' AND lower(c.email) = ?)`).all(login, login, login);
+    const base = baseUrl(req);
+    for (const u of users) {
+      const to = recoveryEmail(u);
+      if (!to) continue;
+      const token = randomToken();
+      q('DELETE FROM password_resets WHERE user_id=? OR expires_at < ?').run(u.id, now());
+      q('INSERT INTO password_resets (token_hash, user_id, expires_at) VALUES (?,?,?)').run(sha256(token), u.id, now() + RESET_MS);
+      const name = u.display_name || u.full_name || u.username;
+      // Se envía en segundo plano: la respuesta es la misma exista o no el usuario.
+      mailer.send({
+        to,
+        subject: `${PRODUCT}: recuperar tu clave`,
+        text: `Hola ${name}:\n\nPediste recuperar la clave del usuario ${u.username} en ${PRODUCT}.\n\nPara elegir una clave nueva, entrá a este enlace dentro de la próxima hora:\n${base}/#reset=${token}\n\nSi no lo pediste vos, ignorá este correo: tu clave actual sigue funcionando.\n`,
+      }).then(() => audit(u.company_id, u.username, 'recuperación de clave enviada', to))
+        .catch((e) => { console.error('recuperación de clave', e.message); audit(u.company_id, u.username, 'recuperación de clave: falló el envío', e.message); });
+    }
+    res.json({ ok: true, message: 'Si el usuario o el email existen y tienen un email cargado, en unos minutos llega un correo con el enlace para elegir una clave nueva. Revisá también la carpeta de spam.' });
+  });
+
+  const resetOf = (token) => (typeof token === 'string' && token
+    ? q('SELECT r.user_id, u.username, u.display_name, u.full_name, u.company_id FROM password_resets r JOIN users u ON u.id = r.user_id WHERE r.token_hash=? AND r.expires_at > ?').get(sha256(token), now())
+    : null);
+  const resetLimiter = rateLimiter({ max: 20, windowMs: 15 * 60_000 });
+  const findReset = (req) => {
+    if (resetLimiter.blocked(req.ip)) throw new HttpError(429, 'Demasiados intentos. Esperá 15 minutos.');
+    const r = resetOf(req.body?.token);
+    if (!r) {
+      resetLimiter.hit(req.ip);
+      throw new HttpError(400, 'El enlace venció o ya se usó. Pedí uno nuevo desde "Olvidé mi clave".');
+    }
+    return r;
+  };
+  app.post('/api/password/reset-info', (req, res) => {
+    const r = findReset(req);
+    res.json({ username: r.username, displayName: r.display_name || r.full_name || r.username });
+  });
+  app.post('/api/password/reset', (req, res) => {
+    const r = findReset(req);
+    valid(() => checkPassword(req.body?.password));
+    const { salt, hash } = hashAdminPassword(req.body.password);
+    q('UPDATE users SET salt=?, hash=? WHERE id=?').run(salt, hash, r.user_id);
+    q('DELETE FROM password_resets WHERE user_id=?').run(r.user_id);
+    q('DELETE FROM sessions WHERE user_id=?').run(r.user_id);
+    audit(r.company_id, r.username, 'clave recuperada por email');
+    res.json({ ok: true, username: r.username });
   });
 
   /** Sesión válida + empresa activa. Para el administrador general, la empresa es la que eligió administrar. */
   const auth = (req, res, next) => {
     const token = readCookie(req);
-    const s = token ? q(`SELECT u.id, u.username, u.salt, u.hash, u.role, u.company_id AS userCompany, s.company_id AS ctxCompany, s.token_hash
+    const s = token ? q(`SELECT u.id, u.username, u.salt, u.hash, u.role, u.full_name, u.display_name, u.email, u.phone,
+                                u.company_id AS userCompany, s.company_id AS ctxCompany, s.token_hash
                          FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?`).get(sha256(token), now()) : null;
     if (!s) return res.status(401).json({ error: 'Sesión vencida' });
     // Un formulario de otro sitio no puede agregar este encabezado.
@@ -354,16 +435,26 @@ export function createApp({
 
   app.get('/api/me', auth, (req, res) => {
     const c = companyById(req.companyId);
+    const u = req.user;
     res.json({
-      username: req.user.username, role: req.user.role, product: PRODUCT, brandPhrase: getSetting('brandPhrase'),
+      username: u.username, role: u.role, product: PRODUCT, brandPhrase: getSetting('brandPhrase'),
+      fullName: u.full_name, displayName: u.display_name || u.full_name || u.username, email: u.email, phone: u.phone,
       company: c ? { id: c.id, name: c.name, status: c.status } : null,
     });
+  });
+
+  /** Cada usuario edita sus propios datos de contacto. */
+  app.put('/api/me', auth, (req, res) => {
+    const d = valid(() => userData(req.body || {}));
+    q('UPDATE users SET full_name=?, display_name=?, phone=?, email=? WHERE id=?').run(d.fullName, d.displayName, d.phone, d.email, req.user.id);
+    audit(req.companyId, actor(req), 'datos de usuario actualizados', req.user.username);
+    res.json({ ok: true, ...d });
   });
 
   app.post('/api/password', auth, (req, res) => {
     const { current, next: nextPass } = req.body || {};
     if (typeof current !== 'string' || !verifyAdminPassword(current, req.user.salt, req.user.hash)) throw new HttpError(400, 'La clave actual no es correcta');
-    if (typeof nextPass !== 'string' || nextPass.length < 10) throw new HttpError(400, 'La clave nueva necesita 10 caracteres o más');
+    valid(() => checkPassword(nextPass));
     const { salt, hash } = hashAdminPassword(nextPass);
     q('UPDATE users SET salt=?, hash=? WHERE id=?').run(salt, hash, req.user.id);
     q('DELETE FROM sessions WHERE user_id=? AND token_hash<>?').run(req.user.id, sha256(readCookie(req)));
@@ -383,6 +474,8 @@ export function createApp({
   app.get('/api/settings', superOnly, (req, res) => res.json({
     brandPhrase: getSetting('brandPhrase'), graceDays: Number(getSetting('graceDays')),
     googleClientId: getSetting('googleClientId'), googleSecretSet: !!getSetting('googleClientSecret'), googleRedirectUri: googleRedirect(req),
+    smtpHost: getSetting('smtpHost'), smtpPort: Number(getSetting('smtpPort')), smtpSecurity: getSetting('smtpSecurity'),
+    smtpUser: getSetting('smtpUser'), smtpPassSet: !!getSetting('smtpPass'), smtpFrom: getSetting('smtpFrom'), mailReady: mailer.ready(),
   }));
   app.put('/api/settings', superOnly, (req, res) => {
     const b = req.body || {};
@@ -393,15 +486,48 @@ export function createApp({
     setSetting('graceDays', grace);
     if (b.googleClientId !== undefined) setSetting('googleClientId', String(b.googleClientId).trim().slice(0, 200));
     if (b.googleClientSecret) setSetting('googleClientSecret', String(b.googleClientSecret).trim().slice(0, 200));
+    if (b.smtpHost !== undefined) {
+      const host = String(b.smtpHost).trim().slice(0, 200);
+      const port = Number(b.smtpPort);
+      if (host && !/^[A-Za-z0-9.-]+$/.test(host)) throw new HttpError(400, 'El servidor SMTP es un nombre o una IP, como smtp.gmail.com');
+      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, 'El puerto SMTP va de 1 a 65535');
+      const from = String(b.smtpFrom || '').trim().slice(0, 160);
+      if (host && !from) throw new HttpError(400, 'Poné el remitente, por ejemplo WiFly MDM <avisos@miempresa.com>');
+      if (/[\r\n]/.test(from) || (from && !/[^\s@<>]+@[^\s@<>]+\.[A-Za-z]{2,}/.test(from))) throw new HttpError(400, 'El remitente tiene que incluir un email válido');
+      setSetting('smtpHost', host);
+      setSetting('smtpPort', port);
+      setSetting('smtpSecurity', b.smtpSecurity === 'tls' ? 'tls' : 'starttls');
+      setSetting('smtpUser', String(b.smtpUser || '').trim().slice(0, 200));
+      setSetting('smtpFrom', from);
+      if (b.smtpPass) setSetting('smtpPass', String(b.smtpPass).slice(0, 200));
+      audit(null, actor(req), 'correo saliente configurado', host || 'desactivado');
+    }
     audit(null, actor(req), 'configuración', `frase "${phrase}", ${grace} días de gracia`);
     wakeAll();
     res.json({ brandPhrase: phrase, graceDays: grace });
   });
 
+  /** Correo de prueba al email del administrador que lo pide, para confirmar la configuración SMTP. */
+  app.post('/api/settings/mail-test', superOnly, aw(async (req, res) => {
+    const to = cleanEmail(req.body?.to) || req.user.email;
+    if (!to) throw new HttpError(400, 'Cargá tu email en Cuenta o escribí a dónde mandar la prueba');
+    if (!mailer.ready()) throw new HttpError(400, 'Primero guardá el servidor SMTP y el remitente');
+    try {
+      await mailer.send({ to, subject: `${PRODUCT}: correo de prueba`, text: `Este es un correo de prueba de ${PRODUCT}.\n\nSi lo recibiste, la recuperación de claves por email ya funciona.\n` });
+    } catch (e) {
+      throw new HttpError(502, `El servidor de correo respondió: ${e.message}`);
+    }
+    audit(null, actor(req), 'correo de prueba', to);
+    res.json({ ok: true, to });
+  }));
+
   const presentCompany = (c, counts) => {
     const n = (sql) => q(`SELECT COUNT(*) AS n FROM devices WHERE company_id=? ${sql}`).get(c.id, ...(sql ? [now() - ONLINE_MS] : [])).n;
     return {
       id: c.id, name: c.name, status: c.status, notes: c.notes, createdAt: c.created_at,
+      legalName: c.legal_name, taxAddress: c.tax_address, taxCondition: c.tax_condition, taxConditionLabel: TAX_CONDITIONS[c.tax_condition] || '',
+      taxId: c.tax_id, email: c.email, phone: c.phone,
+      clients: q('SELECT COUNT(*) AS n FROM clients WHERE company_id=?').get(c.id).n,
       suspendedAt: c.suspended_at, devicesSuspendAt: devicesSuspendAt(c), devicesSuspended: devicesSuspended(c),
       devices: n(''), online: n('AND last_seen > ?'), monthDevices: counts.get(c.id) || 0,
       admins: q(`SELECT username FROM users WHERE company_id=? AND role='admin' ORDER BY username`).all(c.id).map((u) => u.username),
@@ -418,31 +544,62 @@ export function createApp({
     if (!name) throw new HttpError(400, 'Poné el nombre de la empresa');
     return name;
   };
+  /** Datos fiscales y de contacto. Al crear son obligatorios; al editar, una empresa vieja puede quedar incompleta. */
+  const companyData = (b, required) => valid(() => {
+    const cond = String(b.taxCondition || '');
+    if (cond && !TAX_CONDITIONS[cond]) throw new Error('Elegí el tipo de impuesto');
+    if (required && !cond) throw new Error('Elegí el tipo de impuesto: consumidor final, monotributista o responsable inscripto');
+    return {
+      legalName: cleanText(b.legalName, 120, { required, label: 'la razón social' }),
+      taxAddress: cleanText(b.taxAddress, 200, { required, label: 'el domicilio fiscal' }),
+      taxCondition: cond,
+      taxId: cleanTaxId(b.taxId, { required, cuitOnly: cond === 'mono' || cond === 'ri' }),
+      email: cleanEmail(b.email, { required }),
+      phone: cleanPhone(b.phone, { required }),
+    };
+  });
   const getCompany = (id) => {
     const c = companyById(Number(id));
     if (!c) throw new HttpError(404, 'Empresa inexistente');
     return c;
   };
 
-  function createUser({ username, password, role, companyId }) {
-    const u = String(username || '').trim();
+  /** Datos personales de un usuario del panel. El nombre a mostrar, si falta, es el nombre completo. */
+  function userData(b) {
+    const fullName = cleanText(b.fullName, 80, { required: true, label: 'el nombre completo' });
+    return {
+      fullName,
+      displayName: cleanText(b.displayName, 40) || fullName.slice(0, 40),
+      phone: cleanPhone(b.phone),
+      email: cleanEmail(b.email, { required: true }),
+    };
+  }
+
+  function createUser(b, role, companyId) {
+    const u = String(b.username || '').trim();
     if (!USERNAME_RE.test(u)) throw new HttpError(400, 'El usuario va de 3 a 40 caracteres: letras, números, punto, guion, guion bajo o @');
-    if (typeof password !== 'string' || password.length < 10) throw new HttpError(400, 'La clave necesita 10 caracteres o más');
-    if (q('SELECT 1 FROM users WHERE username=?').get(u)) throw new HttpError(409, `Ya existe el usuario ${u}`);
-    const { salt, hash } = hashAdminPassword(password);
-    return q('INSERT INTO users (username, salt, hash, role, company_id, created_at) VALUES (?,?,?,?,?,?)').run(u, salt, hash, role, companyId, now()).lastInsertRowid;
+    const d = valid(() => userData(b));
+    valid(() => checkPassword(b.password));
+    if (q('SELECT 1 FROM users WHERE lower(username)=lower(?)').get(u)) throw new HttpError(409, `Ya existe el usuario ${u}`);
+    const { salt, hash } = hashAdminPassword(b.password);
+    return q(`INSERT INTO users (username, salt, hash, role, company_id, created_at, full_name, display_name, phone, email) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+      .run(u, salt, hash, role, companyId, now(), d.fullName, d.displayName, d.phone, d.email).lastInsertRowid;
   }
 
   app.post('/api/companies', superOnly, (req, res) => {
     const b = req.body || {};
     const name = companyName(b);
     if (q('SELECT 1 FROM companies WHERE name=?').get(name)) throw new HttpError(409, 'Ya existe una empresa con ese nombre');
+    const data = companyData(b, true);
     db.exec('BEGIN');
     let id;
     try {
-      id = q('INSERT INTO companies (name, notes, created_at) VALUES (?,?,?)').run(name, String(b.notes || '').slice(0, 500), now()).lastInsertRowid;
+      id = q(`INSERT INTO companies (name, notes, created_at, legal_name, tax_address, tax_condition, tax_id, email, phone) VALUES (?,?,?,?,?,?,?,?,?)`)
+        .run(name, String(b.notes || '').slice(0, 500), now(), data.legalName, data.taxAddress, data.taxCondition, data.taxId, data.email, data.phone).lastInsertRowid;
       q('INSERT INTO profiles (company_id, name, json, updated_at) VALUES (?,?,?,?)').run(id, 'General', JSON.stringify(DEFAULT_PROFILE), now());
-      if (b.adminUser) createUser({ username: b.adminUser, password: b.adminPassword, role: 'admin', companyId: id });
+      // El administrador usa por defecto el email de la empresa: así recupera su clave aunque no cargue uno propio.
+      const a = b.admin || (b.adminUser ? { username: b.adminUser, password: b.adminPassword } : null);
+      if (a?.username) createUser({ ...a, email: a.email || data.email, phone: a.phone || data.phone }, 'admin', id);
       db.exec('COMMIT');
     } catch (e) {
       db.exec('ROLLBACK');
@@ -458,7 +615,10 @@ export function createApp({
     const clash = q('SELECT id FROM companies WHERE name=?').get(name);
     if (clash && clash.id !== c.id) throw new HttpError(409, 'Ya existe una empresa con ese nombre');
     const notes = req.body?.notes !== undefined ? String(req.body.notes).slice(0, 500) : c.notes;
-    q('UPDATE companies SET name=?, notes=? WHERE id=?').run(name, notes, c.id);
+    const cur = { legalName: c.legal_name, taxAddress: c.tax_address, taxCondition: c.tax_condition, taxId: c.tax_id, email: c.email, phone: c.phone };
+    const data = companyData({ ...cur, ...req.body }, false);
+    q('UPDATE companies SET name=?, notes=?, legal_name=?, tax_address=?, tax_condition=?, tax_id=?, email=?, phone=? WHERE id=?')
+      .run(name, notes, data.legalName, data.taxAddress, data.taxCondition, data.taxId, data.email, data.phone, c.id);
     if (name !== c.name) audit(c.id, actor(req), 'empresa renombrada', `${c.name} → ${name}`);
     wakeCompany(c.id);
     res.json(presentCompany(companyById(c.id), billing.monthCounts(billing.currentMonth())));
@@ -534,8 +694,6 @@ export function createApp({
     }
     next();
   }];
-  /** Express 4 no atrapa errores de funciones async: esto los manda al manejador común. */
-  const aw = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch((e) => next(e instanceof BackupError ? new HttpError(e.status, e.message) : e));
   const auditKey = (req) => (req.backupKey === 'general' ? null : req.companyId);
 
   app.get('/api/backups/google/callback', aw(async (req, res) => {
@@ -592,10 +750,10 @@ export function createApp({
   function billingReport(month) {
     if (!/^\d{4}-\d{2}$/.test(month)) throw new HttpError(400, 'Mes inválido');
     const counts = billing.monthCounts(month);
-    const companies = q('SELECT id, name, status FROM companies ORDER BY name').all();
+    const companies = q('SELECT id, name, status, legal_name, tax_id, tax_condition FROM companies ORDER BY name').all();
     // Una empresa eliminada que facturó ese mes sigue apareciendo con su número.
-    const rows = companies.map((c) => ({ companyId: c.id, name: c.name, status: c.status, devices: counts.get(c.id) || 0 }));
-    for (const [cid, n] of counts) if (!companies.some((c) => c.id === cid)) rows.push({ companyId: cid, name: `Empresa eliminada #${cid}`, status: 'deleted', devices: n });
+    const rows = companies.map((c) => ({ companyId: c.id, name: c.name, legalName: c.legal_name, taxId: c.tax_id, taxCondition: TAX_CONDITIONS[c.tax_condition] || '', status: c.status, devices: counts.get(c.id) || 0 }));
+    for (const [cid, n] of counts) if (!companies.some((c) => c.id === cid)) rows.push({ companyId: cid, name: `Empresa eliminada #${cid}`, legalName: '', taxId: '', taxCondition: '', status: 'deleted', devices: n });
     return { month, closed: billing.isClosed(month), months: billing.months(), rows, total: rows.reduce((t, r) => t + r.devices, 0) };
   }
 
@@ -616,8 +774,8 @@ export function createApp({
 
   app.get('/api/billing.csv', superOnly, (req, res) => {
     const r = billingReport(String(req.query.month || billing.currentMonth()));
-    sendCsv(res, `facturacion-${r.month}.csv`, ['Mes', 'Empresa', 'Estado', 'Equipos facturables', 'Mes cerrado'],
-      [...r.rows.map((x) => [r.month, x.name, STATUS_LABEL[x.status] || x.status, x.devices, r.closed ? 'Sí' : 'No, en curso']), [r.month, 'TOTAL', '', r.total, '']]);
+    sendCsv(res, `facturacion-${r.month}.csv`, ['Mes', 'Empresa', 'Razón social', 'CUIT/DNI', 'Tipo de impuesto', 'Estado', 'Equipos facturables', 'Mes cerrado'],
+      [...r.rows.map((x) => [r.month, x.name, x.legalName, x.taxId, x.taxCondition, STATUS_LABEL[x.status] || x.status, x.devices, r.closed ? 'Sí' : 'No, en curso']), [r.month, 'TOTAL', '', '', '', '', r.total, '']]);
   });
 
   app.get('/api/billing/:companyId/devices.csv', superOnly, (req, res) => {
@@ -632,7 +790,10 @@ export function createApp({
   });
 
   // ---- Usuarios -------------------------------------------------------------------------
-  const presentUser = (u) => ({ id: u.id, username: u.username, role: u.role, roleLabel: ROLE_LABEL[u.role], createdAt: u.created_at });
+  const presentUser = (u) => ({
+    id: u.id, username: u.username, role: u.role, roleLabel: ROLE_LABEL[u.role], createdAt: u.created_at,
+    fullName: u.full_name, displayName: u.display_name || u.full_name, phone: u.phone, email: u.email,
+  });
 
   /** Sin empresa elegida, el administrador general ve a los otros administradores generales. */
   app.get('/api/users', auth, (req, res) => {
@@ -645,12 +806,13 @@ export function createApp({
   const canManage = (req, role) => (isSuper(req) ? true : req.user.role === 'admin' && role === 'operator');
 
   app.post('/api/users', auth, (req, res) => {
-    const { username, password, role } = req.body || {};
+    const b = req.body || {};
+    const { username, role } = b;
     if (!ROLE_LABEL[role]) throw new HttpError(400, 'Rol inválido');
     if (!canManage(req, role)) throw new HttpError(403, 'Tu usuario no puede crear ese tipo de usuario');
     const companyId = role === 'superadmin' ? null : req.companyId;
     if (role !== 'superadmin' && !companyId) throw new HttpError(409, 'Elegí una empresa para administrar', 'no_company');
-    const id = createUser({ username, password, role, companyId });
+    const id = createUser(b, role, companyId);
     audit(companyId, actor(req), 'usuario creado', `${username} (${ROLE_LABEL[role]})`);
     res.json(presentUser(q('SELECT * FROM users WHERE id=?').get(id)));
   });
@@ -663,10 +825,18 @@ export function createApp({
     return u;
   };
 
+  app.patch('/api/users/:id', auth, (req, res) => {
+    const u = manageableUser(req, req.params.id);
+    const d = valid(() => userData({ fullName: u.full_name, displayName: u.display_name, phone: u.phone, email: u.email, ...req.body }));
+    q('UPDATE users SET full_name=?, display_name=?, phone=?, email=? WHERE id=?').run(d.fullName, d.displayName, d.phone, d.email, u.id);
+    audit(u.company_id, actor(req), 'datos de usuario actualizados', u.username);
+    res.json(presentUser(q('SELECT * FROM users WHERE id=?').get(u.id)));
+  });
+
   app.post('/api/users/:id/password', auth, (req, res) => {
     const u = manageableUser(req, req.params.id);
     const pass = req.body?.password;
-    if (typeof pass !== 'string' || pass.length < 10) throw new HttpError(400, 'La clave necesita 10 caracteres o más');
+    valid(() => checkPassword(pass));
     const { salt, hash } = hashAdminPassword(pass);
     q('UPDATE users SET salt=?, hash=? WHERE id=?').run(salt, hash, u.id);
     q('DELETE FROM sessions WHERE user_id=?').run(u.id);
@@ -684,7 +854,9 @@ export function createApp({
   });
 
   // ---- Equipos ----------------------------------------------------------------------------
+  const clientRow = (id) => (id == null ? null : q('SELECT id, ext_id, name FROM clients WHERE id=?').get(id));
   const presentDevice = (d) => {
+    const client = clientRow(d.client_id);
     const state = JSON.parse(d.state);
     const profile = d.profile_id ? q('SELECT name, json FROM profiles WHERE id=?').get(d.profile_id) : null;
     const pj = profile ? JSON.parse(profile.json) : {};
@@ -696,6 +868,7 @@ export function createApp({
       online: waiters.has(d.id) || now() - d.last_seen < ONLINE_MS,
       synced: state.appliedConfig === cfg.version,
       wallpaperSha: pj.wallpaperSha || '', title: cfg.title, effectiveApps: cfg.apps.map((a) => a.package),
+      clientId: client?.id ?? null, clientExtId: client?.ext_id || '', clientName: client?.name || '',
     };
   };
 
@@ -719,6 +892,7 @@ export function createApp({
 
   const validPackage = (p) => typeof p === 'string' && /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$/.test(p);
   const profileOf = (req, id) => (id == null ? null : q('SELECT * FROM profiles WHERE id=? AND company_id=?').get(id, req.companyId));
+  const clientOf = (req, id) => (id == null ? null : q('SELECT * FROM clients WHERE id=? AND company_id=?').get(Number(id), req.companyId));
 
   app.patch('/api/devices/:id', ADMIN, (req, res) => {
     const d = getDevice(req, req.params.id);
@@ -731,12 +905,17 @@ export function createApp({
       if (b.profileId !== null && !profileOf(req, b.profileId)) throw new HttpError(400, 'Perfil inexistente');
       profileId = b.profileId;
     }
+    let clientId = d.client_id;
+    if (b.clientId !== undefined) {
+      if (b.clientId !== null && !clientOf(req, b.clientId)) throw new HttpError(400, 'Cliente inexistente');
+      clientId = b.clientId;
+    }
     let overrides = d.app_overrides;
     if (b.overrides) {
       const clean = (l) => (Array.isArray(l) ? l.filter(validPackage) : []);
       overrides = JSON.stringify({ add: clean(b.overrides.add), remove: clean(b.overrides.remove) });
     }
-    q('UPDATE devices SET name=?, grp=?, notes=?, profile_id=?, app_overrides=? WHERE id=?').run(name, grp, notes, profileId, overrides, d.id);
+    q('UPDATE devices SET name=?, grp=?, notes=?, profile_id=?, app_overrides=?, client_id=? WHERE id=?').run(name, grp, notes, profileId, overrides, clientId, d.id);
     wake(d.id);
     res.json(presentDevice(getDevice(req, d.id)));
   });
@@ -787,6 +966,10 @@ export function createApp({
         q('UPDATE devices SET blocked=?, block_title=?, block_message=? WHERE id=?').run(blocked, title, message, d.id);
         wake(d.id);
       }
+    } else if (action === 'assignClient') {
+      const cid = payload.clientId ?? null;
+      if (cid !== null && !clientOf(req, cid)) throw new HttpError(400, 'Cliente inexistente');
+      for (const d of devices) q('UPDATE devices SET client_id=? WHERE id=?').run(cid, d.id);
     } else if (action === 'assignProfile') {
       if (!profileOf(req, payload.profileId)) throw new HttpError(400, 'Perfil inexistente');
       for (const d of devices) {
@@ -1017,16 +1200,91 @@ export function createApp({
     res.json({ ok: true });
   });
 
+  // ---- Clientes de cada empresa ---------------------------------------------------------------
+  // El ID lo carga la empresa a mano: es el mismo que usa en su sistema de gestión, para vincularlos por API.
+  const EXT_ID_RE = /^[A-Za-z0-9._\/-]{1,40}$/;
+  const byExtId = new Intl.Collator('es', { numeric: true, sensitivity: 'base' });
+  const presentClient = (c) => {
+    const n = q('SELECT COUNT(*) AS n, SUM(CASE WHEN last_seen > ? THEN 1 ELSE 0 END) AS online, SUM(blocked) AS blocked FROM devices WHERE client_id=?').get(now() - ONLINE_MS, c.id);
+    return {
+      id: c.id, extId: c.ext_id, name: c.name, taxId: c.tax_id, address: c.address, phone: c.phone, email: c.email, notes: c.notes,
+      createdAt: c.created_at, updatedAt: c.updated_at, devices: n.n, online: n.online || 0, blocked: n.blocked || 0,
+    };
+  };
+  const clientData = (b) => valid(() => {
+    const extId = String(b.extId ?? '').trim();
+    if (!extId) throw new Error('Poné el ID del cliente');
+    if (!EXT_ID_RE.test(extId)) throw new Error('El ID va de 1 a 40 caracteres: letras, números, punto, guion, guion bajo o barra');
+    return {
+      extId,
+      name: cleanText(b.name, 120, { required: true, label: 'el nombre completo del cliente' }),
+      taxId: cleanTaxId(b.taxId),
+      address: cleanText(b.address, 200),
+      phone: cleanPhone(b.phone),
+      email: cleanEmail(b.email),
+      notes: String(b.notes ?? '').slice(0, 500),
+    };
+  });
+  const getClient = (req, id) => {
+    const c = clientOf(req, id);
+    if (!c) throw new HttpError(404, 'Cliente inexistente');
+    return c;
+  };
+  const extIdTaken = (req, extId, exceptId) => {
+    const r = q('SELECT id FROM clients WHERE company_id=? AND lower(ext_id)=lower(?)').get(req.companyId, extId);
+    return r && r.id !== exceptId;
+  };
+
+  app.get('/api/clients', STAFF, (req, res) => {
+    const list = q('SELECT * FROM clients WHERE company_id=?').all(req.companyId).map(presentClient);
+    res.json(list.sort((a, b) => byExtId.compare(a.extId, b.extId)));
+  });
+  app.get('/api/clients/:id', STAFF, (req, res) => {
+    const c = getClient(req, req.params.id);
+    res.json({ ...presentClient(c), deviceList: q('SELECT * FROM devices WHERE client_id=? ORDER BY name').all(c.id).map(presentDevice) });
+  });
+  app.post('/api/clients', ADMIN, (req, res) => {
+    const d = clientData(req.body || {});
+    if (extIdTaken(req, d.extId)) throw new HttpError(409, `Ya existe un cliente con el ID ${d.extId}`);
+    const id = q('INSERT INTO clients (company_id, ext_id, name, tax_id, address, phone, email, notes, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
+      .run(req.companyId, d.extId, d.name, d.taxId, d.address, d.phone, d.email, d.notes, now(), now()).lastInsertRowid;
+    audit(req.companyId, actor(req), 'cliente creado', `${d.extId} ${d.name}`);
+    res.json(presentClient(q('SELECT * FROM clients WHERE id=?').get(id)));
+  });
+  app.put('/api/clients/:id', ADMIN, (req, res) => {
+    const c = getClient(req, req.params.id);
+    const d = clientData(req.body || {});
+    if (extIdTaken(req, d.extId, c.id)) throw new HttpError(409, `Ya existe un cliente con el ID ${d.extId}`);
+    q('UPDATE clients SET ext_id=?, name=?, tax_id=?, address=?, phone=?, email=?, notes=?, updated_at=? WHERE id=?')
+      .run(d.extId, d.name, d.taxId, d.address, d.phone, d.email, d.notes, now(), c.id);
+    audit(req.companyId, actor(req), 'cliente modificado', `${d.extId} ${d.name}`);
+    res.json(presentClient(q('SELECT * FROM clients WHERE id=?').get(c.id)));
+  });
+  /** Borrar un cliente no toca sus equipos: quedan sin cliente asignado. */
+  app.delete('/api/clients/:id', ADMIN, (req, res) => {
+    const c = getClient(req, req.params.id);
+    q('UPDATE devices SET client_id=NULL WHERE client_id=?').run(c.id);
+    q('UPDATE enroll_tokens SET client_id=NULL WHERE client_id=?').run(c.id);
+    q('DELETE FROM clients WHERE id=?').run(c.id);
+    audit(req.companyId, actor(req), 'cliente eliminado', `${c.ext_id} ${c.name}`);
+    res.json({ ok: true });
+  });
+
   // ---- Tokens de alta -----------------------------------------------------------------------
-  const presentToken = (t) => ({ token: t.token, label: t.label, profileId: t.profile_id, group: t.grp, uses: t.uses, maxUses: t.max_uses, expiresAt: t.expires_at, createdAt: t.created_at });
+  const presentToken = (t) => {
+    const c = clientRow(t.client_id);
+    return { token: t.token, label: t.label, profileId: t.profile_id, group: t.grp, uses: t.uses, maxUses: t.max_uses, expiresAt: t.expires_at, createdAt: t.created_at,
+      clientId: c?.id ?? null, clientName: c ? `${c.ext_id} · ${c.name}` : '' };
+  };
   app.get('/api/enroll-tokens', ADMIN, (req, res) => res.json(q('SELECT * FROM enroll_tokens WHERE company_id=? ORDER BY created_at DESC').all(req.companyId).map(presentToken)));
   app.post('/api/enroll-tokens', ADMIN, (req, res) => {
     const b = req.body || {};
     const token = randomToken(12);
     const days = Math.max(0, Number(b.days) || 0);
     const profile = b.profileId && profileOf(req, b.profileId) ? b.profileId : null;
-    q(`INSERT INTO enroll_tokens (token, company_id, label, profile_id, grp, max_uses, expires_at, created_at) VALUES (?,?,?,?,?,?,?,?)`)
-      .run(token, req.companyId, String(b.label || '').slice(0, 80), profile, String(b.group || '').slice(0, 60), Math.max(0, Number(b.maxUses) || 0), days ? now() + days * DAY_MS : 0, now());
+    if (b.clientId && !clientOf(req, b.clientId)) throw new HttpError(400, 'Cliente inexistente');
+    q(`INSERT INTO enroll_tokens (token, company_id, label, profile_id, grp, max_uses, expires_at, created_at, client_id) VALUES (?,?,?,?,?,?,?,?,?)`)
+      .run(token, req.companyId, String(b.label || '').slice(0, 80), profile, String(b.group || '').slice(0, 60), Math.max(0, Number(b.maxUses) || 0), days ? now() + days * DAY_MS : 0, now(), b.clientId ? Number(b.clientId) : null);
     audit(req.companyId, actor(req), 'token de alta creado', b.label || '');
     res.json(presentToken(q('SELECT * FROM enroll_tokens WHERE token=?').get(token)));
   });
