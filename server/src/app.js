@@ -29,8 +29,29 @@ const IMAGE_MAGIC = [
 ];
 const BULK_COMMANDS = new Set(['message', 'reboot', 'sync', 'install', 'uninstall', 'exitKiosk', 'enterKiosk', 'decommission']);
 /** Lo único que puede hacer un operador sobre los equipos. */
-const OPERATOR_ACTIONS = new Set(['message', 'lock', 'unlock']);
-const ROLE_LABEL = { superadmin: 'administrador general', admin: 'administrador', operator: 'operador' };
+const OPERATOR_ACTIONS = new Set(['message', 'lock', 'unlock', 'assignClient']);
+const ROLE_LABEL = {
+  superadmin: 'administrador general', sysadmin: 'administrador del sistema', sysoperator: 'operador del sistema', billing: 'facturación',
+  admin: 'administrador de la empresa', operator: 'operador de la empresa',
+};
+/** Roles del sistema: no pertenecen a una empresa. */
+const GLOBAL_ROLES = new Set(['superadmin', 'sysadmin', 'sysoperator', 'billing']);
+const COMPANY_ROLES = new Set(['admin', 'operator']);
+const FULL = {
+  companiesAll: true, companiesCreate: true, companiesEdit: true, companiesDelete: true, companiesSuspend: true,
+  billing: true, settings: true, updates: true, backupsGeneral: true, systemUsers: true, audit: true,
+};
+/** Qué puede hacer cada rol del sistema fuera de las empresas. */
+const GLOBAL_PERMS = {
+  superadmin: FULL,
+  sysadmin: FULL,
+  // Solo ve las empresas que tiene asignadas (y las que crea); puede crearlas y editarlas, no borrarlas.
+  sysoperator: { companiesCreate: true, companiesEdit: true },
+  // Ve todo sin modificar nada, salvo suspender y reactivar por falta de pago.
+  billing: { companiesAll: true, companiesSuspend: true, billing: true, audit: true },
+};
+/** Con qué permisos entra cada rol del sistema a una empresa: administrador, o solo lectura. */
+const COMPANY_ROLE_OF_GLOBAL = { superadmin: 'admin', sysadmin: 'admin', sysoperator: 'admin', billing: 'viewer' };
 
 const ACTION_LABEL = { assignClient: 'cambio de cliente', message: 'mensaje', lock: 'bloqueo', unlock: 'desbloqueo', assignProfile: 'cambio de perfil', reboot: 'reinicio', sync: 'sincronización', install: 'instalar app', uninstall: 'desinstalar app', exitKiosk: 'salir del kiosko', enterKiosk: 'activar kiosko', decommission: 'baja' };
 
@@ -96,6 +117,13 @@ export function createApp({
 
   // ---- Empresas -------------------------------------------------------------------------
   const companyById = (id) => (id == null ? null : q('SELECT * FROM companies WHERE id=?').get(id));
+  const assignedCompanies = (userId) => q('SELECT company_id FROM user_companies WHERE user_id=?').all(userId).map((r) => r.company_id);
+  /** Un usuario del sistema ve todas las empresas o, el operador, solo las que tiene asignadas. */
+  const canAccessCompany = (user, cid) => {
+    if (cid == null || !companyById(cid)) return false;
+    if (GLOBAL_PERMS[user.role]?.companiesAll) return true;
+    return !!q('SELECT 1 FROM user_companies WHERE user_id=? AND company_id=?').get(user.id, cid);
+  };
   /** Los TV Box se suspenden cuando pasan los días de gracia desde que se suspendió el panel. */
   const devicesSuspendAt = (c) => (c && c.status === 'suspended' && c.suspended_at ? c.suspended_at + graceMs() : null);
   const devicesSuspended = (c) => {
@@ -324,7 +352,7 @@ export function createApp({
       throw new HttpError(401, 'Usuario o clave incorrectos');
     }
     loginLimiter.clear(req.ip);
-    if (u.role !== 'superadmin' && companyById(u.company_id)?.status !== 'active') throw suspendedPanel();
+    if (!GLOBAL_ROLES.has(u.role) && companyById(u.company_id)?.status !== 'active') throw suspendedPanel();
     const token = randomToken();
     q('DELETE FROM sessions WHERE expires_at < ?').run(now());
     q('INSERT INTO sessions (token_hash, user_id, company_id, expires_at) VALUES (?,?,?,?)').run(sha256(token), u.id, u.company_id, now() + SESSION_MS);
@@ -403,9 +431,13 @@ export function createApp({
     if (!s) return res.status(401).json({ error: 'Sesión vencida' });
     // Un formulario de otro sitio no puede agregar este encabezado.
     if (req.method !== 'GET' && req.get('x-wifly') !== '1') return res.status(403).json({ error: 'Solicitud rechazada' });
-    if (s.role === 'superadmin') {
-      req.companyId = companyById(s.ctxCompany) ? s.ctxCompany : null;
+    if (GLOBAL_ROLES.has(s.role)) {
+      req.perms = GLOBAL_PERMS[s.role];
+      req.companyId = canAccessCompany(s, s.ctxCompany) ? s.ctxCompany : null;
+      req.companyRole = req.companyId ? COMPANY_ROLE_OF_GLOBAL[s.role] : null;
     } else {
+      req.perms = {};
+      req.companyRole = s.role;
       if (companyById(s.userCompany)?.status !== 'active') {
         q('DELETE FROM sessions WHERE token_hash=?').run(s.token_hash);
         return res.status(403).json({ error: suspendedPanel().message, code: 'suspended' });
@@ -416,15 +448,21 @@ export function createApp({
     next();
   };
   const isSuper = (req) => req.user.role === 'superadmin';
-  /** Rutas de una empresa: el administrador general tiene que haber elegido cuál administrar. */
+  const isGlobal = (req) => GLOBAL_ROLES.has(req.user.role);
+  /** Rutas de una empresa: un usuario del sistema tiene que haber elegido cuál administrar. */
   const company = (...roles) => [auth, (req, res, next) => {
     if (!req.companyId) return res.status(409).json({ error: 'Elegí una empresa para administrar', code: 'no_company' });
-    if (!isSuper(req) && !roles.includes(req.user.role)) return res.status(403).json({ error: 'Tu usuario no tiene permiso para esto' });
+    if (!roles.includes(req.companyRole)) {
+      const msg = req.companyRole === 'viewer' ? 'Tu usuario es de solo lectura' : 'Tu usuario no tiene permiso para esto';
+      return res.status(403).json({ error: msg });
+    }
     next();
   }];
-  const superOnly = [auth, (req, res, next) => (isSuper(req) ? next() : res.status(403).json({ error: 'Solo el administrador general puede hacer esto' }))];
+  /** Un permiso del sistema (ver GLOBAL_PERMS). */
+  const need = (perm) => [auth, (req, res, next) => (req.perms[perm] ? next() : res.status(403).json({ error: 'Tu usuario no tiene permiso para esto' }))];
   const ADMIN = company('admin');
   const STAFF = company('admin', 'operator');
+  const VIEW = company('admin', 'operator', 'viewer');
   const actor = (req) => req.user.username;
 
   app.post('/api/logout', auth, (req, res) => {
@@ -439,6 +477,8 @@ export function createApp({
     res.json({
       username: u.username, role: u.role, product: PRODUCT, brandPhrase: getSetting('brandPhrase'),
       fullName: u.full_name, displayName: u.display_name || u.full_name || u.username, email: u.email, phone: u.phone,
+      roleLabel: ROLE_LABEL[u.role], global: isGlobal(req), perms: req.perms, companyRole: req.companyRole,
+      graceDays: Number(getSetting('graceDays')),
       company: c ? { id: c.id, name: c.name, status: c.status } : null,
     });
   });
@@ -463,21 +503,22 @@ export function createApp({
   });
 
   /** El administrador general elige qué empresa administrar (o ninguna, para volver a la vista general). */
-  app.post('/api/context', superOnly, (req, res) => {
+  app.post('/api/context', auth, (req, res) => {
+    if (!isGlobal(req)) throw new HttpError(403, 'Tu usuario no tiene permiso para esto');
     const id = req.body?.companyId ?? null;
-    if (id !== null && !companyById(id)) throw new HttpError(404, 'Empresa inexistente');
+    if (id !== null && !canAccessCompany(req.user, id)) throw new HttpError(404, 'Empresa inexistente');
     q('UPDATE sessions SET company_id=? WHERE token_hash=?').run(id, sha256(readCookie(req)));
     res.json({ ok: true });
   });
 
   // ---- Configuración general y empresas (administrador general) ------------------------
-  app.get('/api/settings', superOnly, (req, res) => res.json({
+  app.get('/api/settings', need('settings'), (req, res) => res.json({
     brandPhrase: getSetting('brandPhrase'), graceDays: Number(getSetting('graceDays')),
     googleClientId: getSetting('googleClientId'), googleSecretSet: !!getSetting('googleClientSecret'), googleRedirectUri: googleRedirect(req),
     smtpHost: getSetting('smtpHost'), smtpPort: Number(getSetting('smtpPort')), smtpSecurity: getSetting('smtpSecurity'),
     smtpUser: getSetting('smtpUser'), smtpPassSet: !!getSetting('smtpPass'), smtpFrom: getSetting('smtpFrom'), mailReady: mailer.ready(),
   }));
-  app.put('/api/settings', superOnly, (req, res) => {
+  app.put('/api/settings', need('settings'), (req, res) => {
     const b = req.body || {};
     const phrase = String(b.brandPhrase ?? '').trim().slice(0, 40);
     const grace = Number(b.graceDays);
@@ -508,7 +549,7 @@ export function createApp({
   });
 
   /** Correo de prueba al email del administrador que lo pide, para confirmar la configuración SMTP. */
-  app.post('/api/settings/mail-test', superOnly, aw(async (req, res) => {
+  app.post('/api/settings/mail-test', need('settings'), aw(async (req, res) => {
     const to = cleanEmail(req.body?.to) || req.user.email;
     if (!to) throw new HttpError(400, 'Cargá tu email en Cuenta o escribí a dónde mandar la prueba');
     if (!mailer.ready()) throw new HttpError(400, 'Primero guardá el servidor SMTP y el remitente');
@@ -534,9 +575,10 @@ export function createApp({
     };
   };
 
-  app.get('/api/companies', superOnly, (req, res) => {
+  app.get('/api/companies', auth, (req, res) => {
+    if (!isGlobal(req)) throw new HttpError(403, 'Tu usuario no tiene permiso para esto');
     const counts = billing.monthCounts(billing.currentMonth());
-    res.json(q('SELECT * FROM companies ORDER BY name').all().map((c) => presentCompany(c, counts)));
+    res.json(q('SELECT * FROM companies ORDER BY name').all().filter((c) => canAccessCompany(req.user, c.id)).map((c) => presentCompany(c, counts)));
   });
 
   const companyName = (b) => {
@@ -558,9 +600,10 @@ export function createApp({
       phone: cleanPhone(b.phone, { required }),
     };
   });
-  const getCompany = (id) => {
+  /** Empresa que el usuario del sistema puede ver; otra empresa responde como si no existiera. */
+  const getCompany = (req, id) => {
     const c = companyById(Number(id));
-    if (!c) throw new HttpError(404, 'Empresa inexistente');
+    if (!c || !canAccessCompany(req.user, c.id)) throw new HttpError(404, 'Empresa inexistente');
     return c;
   };
 
@@ -586,7 +629,7 @@ export function createApp({
       .run(u, salt, hash, role, companyId, now(), d.fullName, d.displayName, d.phone, d.email).lastInsertRowid;
   }
 
-  app.post('/api/companies', superOnly, (req, res) => {
+  app.post('/api/companies', need('companiesCreate'), (req, res) => {
     const b = req.body || {};
     const name = companyName(b);
     if (q('SELECT 1 FROM companies WHERE name=?').get(name)) throw new HttpError(409, 'Ya existe una empresa con ese nombre');
@@ -600,6 +643,8 @@ export function createApp({
       // El administrador usa por defecto el email de la empresa: así recupera su clave aunque no cargue uno propio.
       const a = b.admin || (b.adminUser ? { username: b.adminUser, password: b.adminPassword } : null);
       if (a?.username) createUser({ ...a, email: a.email || data.email, phone: a.phone || data.phone }, 'admin', id);
+      // El operador del sistema queda a cargo de la empresa que crea.
+      if (!req.perms.companiesAll) q('INSERT INTO user_companies (user_id, company_id) VALUES (?,?)').run(req.user.id, id);
       db.exec('COMMIT');
     } catch (e) {
       db.exec('ROLLBACK');
@@ -609,8 +654,8 @@ export function createApp({
     res.json(presentCompany(companyById(id), billing.monthCounts(billing.currentMonth())));
   });
 
-  app.patch('/api/companies/:id', superOnly, (req, res) => {
-    const c = getCompany(req.params.id);
+  app.patch('/api/companies/:id', need('companiesEdit'), (req, res) => {
+    const c = getCompany(req, req.params.id);
     const name = req.body?.name !== undefined ? companyName(req.body) : c.name;
     const clash = q('SELECT id FROM companies WHERE name=?').get(name);
     if (clash && clash.id !== c.id) throw new HttpError(409, 'Ya existe una empresa con ese nombre');
@@ -625,8 +670,8 @@ export function createApp({
   });
 
   /** Suspender: el panel de la empresa se corta ya; sus TV Box, al vencer los días de gracia. */
-  app.post('/api/companies/:id/suspend', superOnly, (req, res) => {
-    const c = getCompany(req.params.id);
+  app.post('/api/companies/:id/suspend', need('companiesSuspend'), (req, res) => {
+    const c = getCompany(req, req.params.id);
     if (c.status !== 'suspended') {
       q(`UPDATE companies SET status='suspended', suspended_at=? WHERE id=?`).run(now(), c.id);
       q('DELETE FROM sessions WHERE user_id IN (SELECT id FROM users WHERE company_id=?)').run(c.id);
@@ -637,16 +682,16 @@ export function createApp({
   });
 
   /** Marcar pagada: vuelven el panel y los TV Box. */
-  app.post('/api/companies/:id/activate', superOnly, (req, res) => {
-    const c = getCompany(req.params.id);
+  app.post('/api/companies/:id/activate', need('companiesSuspend'), (req, res) => {
+    const c = getCompany(req, req.params.id);
     q(`UPDATE companies SET status='active', suspended_at=NULL WHERE id=?`).run(c.id);
     if (c.status !== 'active') audit(c.id, actor(req), 'empresa reactivada', 'pago registrado');
     wakeCompany(c.id);
     res.json(presentCompany(companyById(c.id), billing.monthCounts(billing.currentMonth())));
   });
 
-  app.delete('/api/companies/:id', superOnly, (req, res) => {
-    const c = getCompany(req.params.id);
+  app.delete('/api/companies/:id', need('companiesDelete'), (req, res) => {
+    const c = getCompany(req, req.params.id);
     if (q('SELECT 1 FROM devices WHERE company_id=? LIMIT 1').get(c.id)) throw new HttpError(409, 'La empresa todavía tiene equipos. Eliminá o dá de baja sus equipos primero.');
     const shas = q('SELECT sha FROM files WHERE company_id=?').all(c.id).map((r) => r.sha);
     q('DELETE FROM companies WHERE id=?').run(c.id);
@@ -664,13 +709,13 @@ export function createApp({
       throw new HttpError(e.status || 500, e.message);
     }
   };
-  app.get('/api/updates', superOnly, (req, res) => res.json(updates.status()));
-  app.post('/api/updates/check', superOnly, updateCall((req) => {
+  app.get('/api/updates', need('updates'), (req, res) => res.json(updates.status()));
+  app.post('/api/updates/check', need('updates'), updateCall((req) => {
     const s = updates.request('check');
     audit(null, actor(req), 'buscar actualizaciones');
     return s;
   }));
-  app.post('/api/updates/apply', superOnly, updateCall((req) => {
+  app.post('/api/updates/apply', need('updates'), updateCall((req) => {
     const target = String(req.body?.version || '');
     const s = updates.request('update', target);
     audit(null, actor(req), 'actualización pedida', `${s.current} → ${target}`);
@@ -683,11 +728,11 @@ export function createApp({
   const backupScope = [auth, (req, res, next) => {
     const scope = req.params.scope;
     if (scope === 'general') {
-      if (!isSuper(req)) return res.status(403).json({ error: 'Solo el administrador general maneja el respaldo del sistema' });
+      if (!req.perms.backupsGeneral) return res.status(403).json({ error: 'Tu usuario no maneja el respaldo del sistema' });
       req.backupKey = backups.keyFor(null);
     } else if (scope === 'empresa') {
       if (!req.companyId) return res.status(409).json({ error: 'Elegí una empresa para administrar', code: 'no_company' });
-      if (!isSuper(req) && req.user.role !== 'admin') return res.status(403).json({ error: 'Tu usuario no tiene permiso para esto' });
+      if (req.companyRole !== 'admin') return res.status(403).json({ error: 'Tu usuario no tiene permiso para esto' });
       req.backupKey = backups.keyFor(req.companyId);
     } else {
       return res.status(404).json({ error: 'Ruta inexistente' });
@@ -757,7 +802,7 @@ export function createApp({
     return { month, closed: billing.isClosed(month), months: billing.months(), rows, total: rows.reduce((t, r) => t + r.devices, 0) };
   }
 
-  app.get('/api/billing', superOnly, (req, res) => res.json(billingReport(String(req.query.month || billing.currentMonth()))));
+  app.get('/api/billing', need('billing'), (req, res) => res.json(billingReport(String(req.query.month || billing.currentMonth()))));
 
   /** CSV con punto y coma y BOM: Excel en español lo abre directo en columnas. */
   const sendCsv = (res, filename, header, rows) => {
@@ -772,13 +817,13 @@ export function createApp({
   };
   const STATUS_LABEL = { active: 'Activa', suspended: 'Suspendida', deleted: 'Eliminada' };
 
-  app.get('/api/billing.csv', superOnly, (req, res) => {
+  app.get('/api/billing.csv', need('billing'), (req, res) => {
     const r = billingReport(String(req.query.month || billing.currentMonth()));
     sendCsv(res, `facturacion-${r.month}.csv`, ['Mes', 'Empresa', 'Razón social', 'CUIT/DNI', 'Tipo de impuesto', 'Estado', 'Equipos facturables', 'Mes cerrado'],
       [...r.rows.map((x) => [r.month, x.name, x.legalName, x.taxId, x.taxCondition, STATUS_LABEL[x.status] || x.status, x.devices, r.closed ? 'Sí' : 'No, en curso']), [r.month, 'TOTAL', '', '', '', '', r.total, '']]);
   });
 
-  app.get('/api/billing/:companyId/devices.csv', superOnly, (req, res) => {
+  app.get('/api/billing/:companyId/devices.csv', need('billing'), (req, res) => {
     const month = String(req.query.month || billing.currentMonth());
     if (!/^\d{4}-\d{2}$/.test(month)) throw new HttpError(400, 'Mes inválido');
     const cid = Number(req.params.companyId);
@@ -793,26 +838,64 @@ export function createApp({
   const presentUser = (u) => ({
     id: u.id, username: u.username, role: u.role, roleLabel: ROLE_LABEL[u.role], createdAt: u.created_at,
     fullName: u.full_name, displayName: u.display_name || u.full_name, phone: u.phone, email: u.email,
+    companies: u.role === 'sysoperator'
+      ? q('SELECT c.id, c.name FROM user_companies uc JOIN companies c ON c.id = uc.company_id WHERE uc.user_id=? ORDER BY c.name').all(u.id)
+      : undefined,
   });
 
-  /** Sin empresa elegida, el administrador general ve a los otros administradores generales. */
+  /**
+   * Quién gestiona a quién:
+   * - El administrador general es único y se gestiona solo desde su Cuenta; él crea administradores del sistema.
+   * - El administrador del sistema crea operadores del sistema y usuarios de facturación.
+   * - Dentro de una empresa, quien la administra crea administradores y operadores de esa empresa.
+   */
+  const canManage = (req, role, companyId) => {
+    if (role === 'superadmin' || role === 'sysadmin') return isSuper(req);
+    if (GLOBAL_ROLES.has(role)) return !!req.perms.systemUsers;
+    return !!req.companyId && companyId === req.companyId && req.companyRole === 'admin';
+  };
+  const cleanCompanyIds = (req, ids) => {
+    if (!Array.isArray(ids)) return [];
+    const list = [...new Set(ids.map(Number))];
+    for (const id of list) if (!companyById(id)) throw new HttpError(400, 'Una de las empresas elegidas no existe');
+    return list;
+  };
+  const setAssigned = (userId, ids) => {
+    q('DELETE FROM user_companies WHERE user_id=?').run(userId);
+    for (const id of ids) q('INSERT INTO user_companies (user_id, company_id) VALUES (?,?)').run(userId, id);
+  };
+
+  /** `scope=system`: los usuarios del sistema. Si no, los de la empresa que se está administrando. */
   app.get('/api/users', auth, (req, res) => {
-    if (isSuper(req) && !req.companyId) return res.json(q(`SELECT * FROM users WHERE role='superadmin' ORDER BY username`).all().map(presentUser));
-    if (!req.companyId || (!isSuper(req) && req.user.role !== 'admin')) throw new HttpError(403, 'Tu usuario no tiene permiso para esto');
-    res.json(q('SELECT * FROM users WHERE company_id=? ORDER BY role, username').all(req.companyId).map(presentUser));
+    if (req.query.scope === 'system') {
+      if (!req.perms.systemUsers) throw new HttpError(403, 'Tu usuario no tiene permiso para esto');
+      const order = `CASE role WHEN 'superadmin' THEN 0 WHEN 'sysadmin' THEN 1 WHEN 'sysoperator' THEN 2 ELSE 3 END`;
+      return res.json(q(`SELECT * FROM users WHERE company_id IS NULL ORDER BY ${order}, username`).all().map(presentUser));
+    }
+    if (!req.companyId) throw new HttpError(409, 'Elegí una empresa para administrar', 'no_company');
+    if (req.companyRole !== 'admin' && req.companyRole !== 'viewer') throw new HttpError(403, 'Tu usuario no tiene permiso para esto');
+    res.json(q(`SELECT * FROM users WHERE company_id=? ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, username`).all(req.companyId).map(presentUser));
   });
-
-  /** Quién puede gestionar a quién: el general a todos; el administrador de empresa, solo a sus operadores. */
-  const canManage = (req, role) => (isSuper(req) ? true : req.user.role === 'admin' && role === 'operator');
 
   app.post('/api/users', auth, (req, res) => {
     const b = req.body || {};
     const { username, role } = b;
     if (!ROLE_LABEL[role]) throw new HttpError(400, 'Rol inválido');
-    if (!canManage(req, role)) throw new HttpError(403, 'Tu usuario no puede crear ese tipo de usuario');
-    const companyId = role === 'superadmin' ? null : req.companyId;
-    if (role !== 'superadmin' && !companyId) throw new HttpError(409, 'Elegí una empresa para administrar', 'no_company');
-    const id = createUser(b, role, companyId);
+    if (role === 'superadmin') throw new HttpError(403, 'El rol de administrador general está reservado al usuario principal');
+    const companyId = COMPANY_ROLES.has(role) ? req.companyId : null;
+    if (COMPANY_ROLES.has(role) && !companyId) throw new HttpError(409, 'Elegí una empresa para administrar', 'no_company');
+    if (!canManage(req, role, companyId)) throw new HttpError(403, 'Tu usuario no puede crear ese tipo de usuario');
+    const ids = role === 'sysoperator' ? cleanCompanyIds(req, b.companyIds) : [];
+    db.exec('BEGIN');
+    let id;
+    try {
+      id = createUser(b, role, companyId);
+      setAssigned(id, ids);
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
     audit(companyId, actor(req), 'usuario creado', `${username} (${ROLE_LABEL[role]})`);
     res.json(presentUser(q('SELECT * FROM users WHERE id=?').get(id)));
   });
@@ -820,16 +903,34 @@ export function createApp({
   const manageableUser = (req, id) => {
     const u = q('SELECT * FROM users WHERE id=?').get(Number(id));
     if (!u) throw new HttpError(404, 'Usuario inexistente');
-    const sameScope = u.role === 'superadmin' ? isSuper(req) : u.company_id === req.companyId || isSuper(req);
-    if (!sameScope || !canManage(req, u.role)) throw new HttpError(403, 'Tu usuario no puede modificar a ese usuario');
+    if (u.id === req.user.id) throw new HttpError(400, 'Tus propios datos y tu clave se cambian en Cuenta');
+    if (!canManage(req, u.role, u.company_id)) throw new HttpError(403, 'Tu usuario no puede modificar a ese usuario');
     return u;
   };
 
+  /** Datos, rol y, para un operador del sistema, sus empresas. El rol cambia solo dentro del mismo ámbito. */
   app.patch('/api/users/:id', auth, (req, res) => {
     const u = manageableUser(req, req.params.id);
-    const d = valid(() => userData({ fullName: u.full_name, displayName: u.display_name, phone: u.phone, email: u.email, ...req.body }));
-    q('UPDATE users SET full_name=?, display_name=?, phone=?, email=? WHERE id=?').run(d.fullName, d.displayName, d.phone, d.email, u.id);
-    audit(u.company_id, actor(req), 'datos de usuario actualizados', u.username);
+    const b = req.body || {};
+    const d = valid(() => userData({ fullName: u.full_name, displayName: u.display_name, phone: u.phone, email: u.email, ...b }));
+    let role = u.role;
+    if (b.role !== undefined && b.role !== u.role) {
+      if (!ROLE_LABEL[b.role] || b.role === 'superadmin') throw new HttpError(400, 'Rol inválido');
+      if (GLOBAL_ROLES.has(b.role) !== GLOBAL_ROLES.has(u.role)) throw new HttpError(400, 'Un usuario del sistema no puede pasar a ser de una empresa, ni al revés');
+      if (!canManage(req, b.role, u.company_id)) throw new HttpError(403, 'Tu usuario no puede asignar ese rol');
+      role = b.role;
+    }
+    db.exec('BEGIN');
+    try {
+      q('UPDATE users SET full_name=?, display_name=?, phone=?, email=?, role=? WHERE id=?').run(d.fullName, d.displayName, d.phone, d.email, role, u.id);
+      if (role !== 'sysoperator') setAssigned(u.id, []);
+      else if (b.companyIds !== undefined) setAssigned(u.id, cleanCompanyIds(req, b.companyIds));
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
+    }
+    audit(u.company_id, actor(req), 'usuario modificado', `${u.username}${role !== u.role ? `: ${ROLE_LABEL[u.role]} → ${ROLE_LABEL[role]}` : ''}`);
     res.json(presentUser(q('SELECT * FROM users WHERE id=?').get(u.id)));
   });
 
@@ -846,7 +947,6 @@ export function createApp({
 
   app.delete('/api/users/:id', auth, (req, res) => {
     const u = manageableUser(req, req.params.id);
-    if (u.id === req.user.id) throw new HttpError(400, 'No podés eliminar tu propio usuario');
     if (u.role === 'superadmin' && q(`SELECT COUNT(*) AS n FROM users WHERE role='superadmin'`).get().n <= 1) throw new HttpError(400, 'Tiene que quedar al menos un administrador general');
     q('DELETE FROM users WHERE id=?').run(u.id);
     audit(u.company_id, actor(req), 'usuario eliminado', u.username);
@@ -872,7 +972,7 @@ export function createApp({
     };
   };
 
-  app.get('/api/devices', STAFF, (req, res) => {
+  app.get('/api/devices', VIEW, (req, res) => {
     res.json(q('SELECT * FROM devices WHERE company_id=? ORDER BY grp, name').all(req.companyId).map(presentDevice));
   });
 
@@ -882,7 +982,7 @@ export function createApp({
     return d;
   };
 
-  app.get('/api/devices/:id', STAFF, (req, res) => {
+  app.get('/api/devices/:id', VIEW, (req, res) => {
     expireOld();
     const d = getDevice(req, req.params.id);
     const commands = q('SELECT type, payload, status, detail, created_at AS createdAt, updated_at AS updatedAt FROM commands WHERE device_id=? ORDER BY created_at DESC LIMIT 30').all(d.id)
@@ -894,9 +994,13 @@ export function createApp({
   const profileOf = (req, id) => (id == null ? null : q('SELECT * FROM profiles WHERE id=? AND company_id=?').get(id, req.companyId));
   const clientOf = (req, id) => (id == null ? null : q('SELECT * FROM clients WHERE id=? AND company_id=?').get(Number(id), req.companyId));
 
-  app.patch('/api/devices/:id', ADMIN, (req, res) => {
+  app.patch('/api/devices/:id', STAFF, (req, res) => {
     const d = getDevice(req, req.params.id);
     const b = req.body || {};
+    // El operador edita nombre, grupo, notas y cliente; el perfil y las apps son del administrador.
+    if (req.companyRole === 'operator' && ((b.profileId !== undefined && b.profileId !== d.profile_id) || b.overrides)) {
+      throw new HttpError(403, 'Un operador no puede cambiar el perfil ni las apps de un equipo');
+    }
     const name = typeof b.name === 'string' && b.name.trim() ? b.name.trim().slice(0, 80) : d.name;
     const grp = typeof b.group === 'string' ? b.group.trim().slice(0, 60) : d.grp;
     const notes = typeof b.notes === 'string' ? b.notes.slice(0, 500) : d.notes;
@@ -952,7 +1056,7 @@ export function createApp({
   // Acciones sobre uno o varios equipos: el corazón del panel.
   app.post('/api/devices/bulk', STAFF, (req, res) => {
     const { ids, action, payload = {} } = req.body || {};
-    if (req.user.role === 'operator' && !OPERATOR_ACTIONS.has(action)) throw new HttpError(403, 'Un operador solo puede enviar mensajes, bloquear y desbloquear');
+    if (req.companyRole === 'operator' && !OPERATOR_ACTIONS.has(action)) throw new HttpError(403, 'Un operador solo puede enviar mensajes, bloquear, desbloquear y asignar clientes');
     if (!Array.isArray(ids) || !ids.length) throw new HttpError(400, 'Seleccioná al menos un equipo');
     const devices = ids.map((id) => q('SELECT id, name FROM devices WHERE id=? AND company_id=?').get(id, req.companyId)).filter(Boolean);
     if (!devices.length) throw new HttpError(404, 'Los equipos seleccionados ya no existen');
@@ -990,7 +1094,7 @@ export function createApp({
     res.json({ ok: true, count: devices.length, batch });
   });
 
-  app.get('/api/sends', STAFF, (req, res) => {
+  app.get('/api/sends', VIEW, (req, res) => {
     expireOld();
     const rows = q(`SELECT c.batch_id AS batch, c.type, c.payload, c.status, c.detail, c.created_at AS createdAt, d.name AS device
                     FROM commands c JOIN devices d ON d.id = c.device_id WHERE d.company_id=? ORDER BY c.created_at DESC LIMIT 500`).all(req.companyId);
@@ -1004,7 +1108,8 @@ export function createApp({
 
   /** Actividad: la de la empresa elegida, o la general si el administrador general no eligió ninguna. */
   app.get('/api/audit', auth, (req, res) => {
-    if (req.user.role === 'operator') throw new HttpError(403, 'Tu usuario no tiene permiso para esto');
+    const ok = req.companyId ? req.companyRole === 'admin' || req.companyRole === 'viewer' : req.perms.audit;
+    if (!ok) throw new HttpError(403, 'Tu usuario no tiene permiso para esto');
     const rows = req.companyId
       ? q('SELECT ts, actor, action, detail FROM audit WHERE company_id=? ORDER BY id DESC LIMIT 200').all(req.companyId)
       : q(`SELECT a.ts, a.actor, a.action, a.detail, c.name AS company FROM audit a LEFT JOIN companies c ON c.id = a.company_id ORDER BY a.id DESC LIMIT 200`).all();
@@ -1070,7 +1175,7 @@ export function createApp({
     return name;
   };
 
-  app.get('/api/profiles', ADMIN, (req, res) => res.json(q('SELECT * FROM profiles WHERE company_id=? ORDER BY name').all(req.companyId).map(presentProfile)));
+  app.get('/api/profiles', VIEW, (req, res) => res.json(q('SELECT * FROM profiles WHERE company_id=? ORDER BY name').all(req.companyId).map(presentProfile)));
 
   app.post('/api/profiles', ADMIN, (req, res) => {
     const name = profileName(req.body);
@@ -1176,8 +1281,8 @@ export function createApp({
     }
   });
 
-  app.get('/api/files', ADMIN, (req, res) => res.json(q(`SELECT * FROM files WHERE company_id=? AND kind <> 'part' ORDER BY created_at DESC`).all(req.companyId).map(presentFile)));
-  app.get('/api/files/:sha/content', STAFF, (req, res) => sendStored(res, req.companyId, req.params.sha));
+  app.get('/api/files', VIEW, (req, res) => res.json(q(`SELECT * FROM files WHERE company_id=? AND kind <> 'part' ORDER BY created_at DESC`).all(req.companyId).map(presentFile)));
+  app.get('/api/files/:sha/content', VIEW, (req, res) => sendStored(res, req.companyId, req.params.sha));
 
   app.delete('/api/files/:sha', ADMIN, (req, res) => {
     const cid = req.companyId;
@@ -1235,15 +1340,15 @@ export function createApp({
     return r && r.id !== exceptId;
   };
 
-  app.get('/api/clients', STAFF, (req, res) => {
+  app.get('/api/clients', VIEW, (req, res) => {
     const list = q('SELECT * FROM clients WHERE company_id=?').all(req.companyId).map(presentClient);
     res.json(list.sort((a, b) => byExtId.compare(a.extId, b.extId)));
   });
-  app.get('/api/clients/:id', STAFF, (req, res) => {
+  app.get('/api/clients/:id', VIEW, (req, res) => {
     const c = getClient(req, req.params.id);
     res.json({ ...presentClient(c), deviceList: q('SELECT * FROM devices WHERE client_id=? ORDER BY name').all(c.id).map(presentDevice) });
   });
-  app.post('/api/clients', ADMIN, (req, res) => {
+  app.post('/api/clients', STAFF, (req, res) => {
     const d = clientData(req.body || {});
     if (extIdTaken(req, d.extId)) throw new HttpError(409, `Ya existe un cliente con el ID ${d.extId}`);
     const id = q('INSERT INTO clients (company_id, ext_id, name, tax_id, address, phone, email, notes, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
@@ -1251,7 +1356,7 @@ export function createApp({
     audit(req.companyId, actor(req), 'cliente creado', `${d.extId} ${d.name}`);
     res.json(presentClient(q('SELECT * FROM clients WHERE id=?').get(id)));
   });
-  app.put('/api/clients/:id', ADMIN, (req, res) => {
+  app.put('/api/clients/:id', STAFF, (req, res) => {
     const c = getClient(req, req.params.id);
     const d = clientData(req.body || {});
     if (extIdTaken(req, d.extId, c.id)) throw new HttpError(409, `Ya existe un cliente con el ID ${d.extId}`);
@@ -1276,8 +1381,8 @@ export function createApp({
     return { token: t.token, label: t.label, profileId: t.profile_id, group: t.grp, uses: t.uses, maxUses: t.max_uses, expiresAt: t.expires_at, createdAt: t.created_at,
       clientId: c?.id ?? null, clientName: c ? `${c.ext_id} · ${c.name}` : '' };
   };
-  app.get('/api/enroll-tokens', ADMIN, (req, res) => res.json(q('SELECT * FROM enroll_tokens WHERE company_id=? ORDER BY created_at DESC').all(req.companyId).map(presentToken)));
-  app.post('/api/enroll-tokens', ADMIN, (req, res) => {
+  app.get('/api/enroll-tokens', STAFF, (req, res) => res.json(q('SELECT * FROM enroll_tokens WHERE company_id=? ORDER BY created_at DESC').all(req.companyId).map(presentToken)));
+  app.post('/api/enroll-tokens', STAFF, (req, res) => {
     const b = req.body || {};
     const token = randomToken(12);
     const days = Math.max(0, Number(b.days) || 0);

@@ -104,7 +104,7 @@ test('una instalación nueva arranca sin empresas', async () => {
   const ctx = createApp({ dataDir: fresh, adminPassword: 'Clave-nueva-123', billingIntervalMs: 0 });
   assert.equal(ctx.db.prepare('SELECT COUNT(*) AS n FROM companies').get().n, 0);
   assert.equal(ctx.db.prepare(`SELECT role FROM users`).get().role, 'superadmin');
-  assert.equal(ctx.db.prepare('PRAGMA user_version').get().user_version, 4);
+  assert.equal(ctx.db.prepare('PRAGMA user_version').get().user_version, 5);
   ctx.close();
   fs.rmSync(fresh, { recursive: true, force: true });
 });

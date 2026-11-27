@@ -266,34 +266,35 @@ function companyFields(c = {}) {
 }
 
 // ---- Marco -----------------------------------------------------------------------------------
-// Cada vista dice quién la ve: g = administrador general sin empresa elegida, a = administrador de empresa,
-// o = operador. El administrador general que eligió una empresa ve las vistas de empresa además de las suyas.
+// Cada vista dice si es del sistema (fuera de las empresas), de la empresa que se administra, o la cuenta propia,
+// y quién la ve. Los permisos los manda el servidor en /api/me según el rol.
+const isGlobal = () => !!me?.global;
+const isSuper = () => me?.role === 'superadmin';
+const perm = (p) => !!me?.perms?.[p];
+const cRole = () => me?.companyRole || null;
+const canAdmin = () => cRole() === 'admin';
+const canAct = () => cRole() === 'admin' || cRole() === 'operator';
+const isViewer = () => cRole() === 'viewer';
 const VIEWS = [
-  ['companies', 'Empresas', viewCompanies, 'g'],
-  ['billing', 'Facturación', viewBilling, 'g'],
-  ['backups', 'Respaldos', () => viewBackups('general'), 'g'],
-  ['settings', 'Configuración', viewSettings, 'g'],
-  ['wall', 'Pantallas', viewWall, 'ao'],
-  ['clients', 'Clientes', viewClients, 'ao'],
-  ['profiles', 'Perfiles', viewProfiles, 'a'],
-  ['library', 'Biblioteca', viewLibrary, 'a'],
-  ['sends', 'Envíos', viewSends, 'ao'],
-  ['enroll', 'Alta de equipos', viewEnroll, 'a'],
-  ['users', 'Usuarios', viewUsers, 'a'],
-  ['cbackups', 'Respaldos', () => viewBackups('empresa'), 'a'],
-  ['account', 'Cuenta', viewAccount, 'gao'],
+  ['companies', 'Empresas', viewCompanies, 'system', () => isGlobal()],
+  ['billing', 'Facturación', viewBilling, 'system', () => perm('billing')],
+  ['sysusers', 'Usuarios', viewSystemUsers, 'system', () => perm('systemUsers')],
+  ['backups', 'Respaldos', () => viewBackups('general'), 'system', () => perm('backupsGeneral')],
+  ['settings', 'Configuración', viewSettings, 'system', () => perm('settings')],
+  ['wall', 'Pantallas', viewWall, 'company', () => !!cRole()],
+  ['clients', 'Clientes', viewClients, 'company', () => !!cRole()],
+  ['profiles', 'Perfiles', viewProfiles, 'company', canAdmin],
+  ['library', 'Biblioteca', viewLibrary, 'company', canAdmin],
+  ['sends', 'Envíos', viewSends, 'company', () => !!cRole()],
+  ['enroll', 'Alta de equipos', viewEnroll, 'company', canAct],
+  ['users', 'Usuarios', viewUsers, 'company', () => canAdmin() || isViewer()],
+  ['cbackups', 'Respaldos', () => viewBackups('empresa'), 'company', canAdmin],
+  ['account', 'Cuenta', viewAccount, 'account', () => true],
 ];
 let current = 'wall';
 let $main;
 let me = null;
-
-const isSuper = () => me?.role === 'superadmin';
-const isOperator = () => me?.role === 'operator';
-const canAdmin = () => isSuper() || me?.role === 'admin';
-function allowed(who) {
-  if (isSuper()) return who.includes('g') || (!!me.company && (who.includes('a') || who.includes('o')));
-  return who.includes(isOperator() ? 'o' : 'a');
-}
+const allowed = (view) => view[4]();
 
 /** Nombre de la empresa con la frase fija más chica, como en la pantalla del TV Box. */
 function brandBlock(name, phrase) {
@@ -303,18 +304,18 @@ function brandBlock(name, phrase) {
 
 async function start() {
   me = await api('GET', '/api/me');
-  const views = VIEWS.filter(([, , , who]) => allowed(who));
-  const globalViews = views.filter(([, , , who]) => who.includes('g') && who !== 'gao');
-  const companyViews = views.filter(([, , , who]) => !who.includes('g'));
+  const views = VIEWS.filter(allowed);
+  const globalViews = views.filter((v) => v[3] === 'system');
+  const companyViews = views.filter((v) => v[3] === 'company');
   const navButton = ([id, label]) => h('button', { 'data-v': id, onclick: () => go(id) }, label);
   $main = h('main', { id: 'main' });
-  const brand = me.company && !isSuper() ? brandBlock(me.company.name, me.brandPhrase) : brandBlock(me.product);
+  const brand = me.company && !isGlobal() ? brandBlock(me.company.name, me.brandPhrase) : brandBlock(me.product);
   $app.replaceChildren(h('div', { class: 'shell' },
     h('nav', { class: 'rail', 'aria-label': 'Secciones' },
       brand,
       globalViews.map(navButton),
-      isSuper() && me.company ? h('div', { class: 'rail-company' },
-        h('span', { class: 'rail-label' }, 'Administrando'),
+      isGlobal() && me.company ? h('div', { class: 'rail-company' },
+        h('span', { class: 'rail-label' }, isViewer() ? 'Viendo (solo lectura)' : 'Administrando'),
         h('strong', {}, me.company.name),
         h('button', { class: 'rail-back', onclick: guard(() => setContext(null)) }, 'Volver a empresas')) : null,
       companyViews.map(navButton),
@@ -323,13 +324,13 @@ async function start() {
         navButton(['account', 'Cuenta']),
         h('button', { onclick: guard(async () => { await api('POST', '/api/logout', {}); showLogin(); }) }, 'Salir'))),
     $main));
-  const first = isSuper() && !me.company ? 'companies' : 'wall';
+  const first = isGlobal() && !me.company ? 'companies' : 'wall';
   const hash = location.hash.slice(1);
   if (hash.startsWith('backups-google=')) {
     // Google vuelve acá después de conectar Drive.
     const p = new URLSearchParams(hash);
     setTimeout(() => toast(p.get('msg') || '', p.get('backups-google') !== 'ok'), 300);
-    return go(me.company && allowed('a') ? 'cbackups' : 'backups');
+    return go(me.company && canAdmin() ? 'cbackups' : 'backups');
   }
   go(hash || first);
 }
@@ -341,7 +342,7 @@ async function setContext(companyId) {
 }
 
 function go(id) {
-  const view = VIEWS.find(([v, , , who]) => v === id && allowed(who)) || VIEWS.find(([v, , , who]) => allowed(who) && v !== 'account');
+  const view = VIEWS.find((v) => v[0] === id && allowed(v)) || VIEWS.find((v) => allowed(v) && v[0] !== 'account');
   id = view[0];
   current = id;
   stopTimer();
@@ -389,7 +390,7 @@ async function viewWall() {
       h('select', { 'aria-label': 'Estado', onchange: (e) => { filter.status = e.target.value; paint(); } },
         [['', 'Todos los estados'], ['online', 'En línea'], ['offline', 'Sin señal'], ['blocked', 'Bloqueados'], ['alert', 'Con alertas']].map(([v, t]) => h('option', { value: v, selected: filter.status === v }, t))),
       groupSel, clientSel,
-      h('button', { onclick: () => { visible().forEach((d) => selected.add(d.id)); paint(); } }, 'Seleccionar los visibles'),
+      canAct() ? h('button', { onclick: () => { visible().forEach((d) => selected.add(d.id)); paint(); } }, 'Seleccionar los visibles') : null,
       toggle),
     wallBox);
 
@@ -442,7 +443,7 @@ async function viewWall() {
     const toggleOne = (d) => { if (selected.has(d.id)) selected.delete(d.id); else selected.add(d.id); paint(); };
     return h('div', { class: 'sheet' }, h('div', { class: 'table-wrap' }, h('table', { class: 'devices' },
       h('thead', {}, h('tr', {},
-        h('th', {}, h('input', { type: 'checkbox', checked: allSel, 'aria-label': 'Seleccionar todos los visibles', onchange: () => { list.forEach((d) => (allSel ? selected.delete(d.id) : selected.add(d.id))); paint(); } })),
+        h('th', {}, canAct() && h('input', { type: 'checkbox', checked: allSel, 'aria-label': 'Seleccionar todos los visibles', onchange: () => { list.forEach((d) => (allSel ? selected.delete(d.id) : selected.add(d.id))); paint(); } })),
         ['Equipo', 'Cliente', 'Estado', 'Red', 'Perfil', ''].map((t) => h('th', { class: t === 'Red' || t === 'Perfil' ? 'opt' : null }, t)))),
       h('tbody', {}, list.map((d) => {
         const alerts = alertsOf(d);
@@ -452,7 +453,7 @@ async function viewWall() {
         else if (d.online) state = [h('span', { class: 'dot on' }), d.state.kiosk === false ? 'En línea, fuera del kiosko' : 'En línea'];
         else state = [h('span', { class: 'dot' }), `Sin señal, visto ${ago(d.lastSeen)}`];
         return h('tr', { class: selected.has(d.id) ? 'sel' : null },
-          h('td', {}, h('input', { type: 'checkbox', checked: selected.has(d.id), 'data-id': d.id, 'aria-label': `Seleccionar ${d.name}`, onchange: () => toggleOne(d) })),
+          h('td', {}, canAct() && h('input', { type: 'checkbox', checked: selected.has(d.id), 'data-id': d.id, 'aria-label': `Seleccionar ${d.name}`, onchange: () => toggleOne(d) })),
           h('td', {}, h('strong', {}, d.name), h('br'), h('small', {}, [d.state.model, d.group].filter(Boolean).join(' · '))),
           h('td', {}, d.clientId ? [d.clientName, h('br'), h('small', {}, `ID ${d.clientExtId}`)] : h('span', { class: 'hint' }, 'Sin cliente')),
           h('td', {}, state, alerts.length ? [h('br'), h('small', { class: 'alert-line' }, alerts[0])] : null),
@@ -473,7 +474,7 @@ async function viewWall() {
     } else if (!d.online) {
       glass = h('span', { class: 'glass off' }, 'Sin señal');
     } else {
-      glass = h('span', { class: 'glass' }, h('span', { class: 'top' }, h('span', {}, d.title || 'WiFly'), h('span', { class: 'tick' }, sel ? '✓' : '')), h('span', { class: 'state' }, d.state.kiosk === false ? 'Fuera del kiosko' : `${d.effectiveApps.length} apps`));
+      glass = h('span', { class: 'glass' }, h('span', { class: 'top' }, h('span', {}, d.title || 'WiFly'), canAct() ? h('span', { class: 'tick' }, sel ? '✓' : '') : null), h('span', { class: 'state' }, d.state.kiosk === false ? 'Fuera del kiosko' : `${d.effectiveApps.length} apps`));
       if (d.wallpaperSha) glass.style.backgroundImage = bgImage(d.wallpaperSha);
     }
     if (d.blocked || d.suspended || !d.online) {
@@ -483,7 +484,7 @@ async function viewWall() {
       h('button', {
         class: 'screen', 'data-id': d.id, 'aria-pressed': String(sel),
         'aria-label': `Seleccionar ${d.name}`,
-        onclick: () => { if (sel) selected.delete(d.id); else selected.add(d.id); paint(); },
+        onclick: () => { if (!canAct()) return openDevice(d.id, load); if (sel) selected.delete(d.id); else selected.add(d.id); paint(); },
       }, glass, h('span', { class: `power${d.online ? ' on' : ''}` })),
       h('div', { class: 'caption' },
         h('div', {},
@@ -496,7 +497,7 @@ async function viewWall() {
 
   function paintBar() {
     document.querySelector('.actionbar')?.remove();
-    if (!selected.size) return;
+    if (!selected.size || !canAct()) return;
     const ids = [...selected];
     $app.append(h('div', { class: 'actionbar', role: 'region', 'aria-label': 'Acciones sobre la selección' },
       h('strong', {}, `${plural(ids.length, 'equipo seleccionado', 'equipos seleccionados')}`),
@@ -504,7 +505,7 @@ async function viewWall() {
       h('button', { class: 'stop', onclick: () => lockDialog(ids, load) }, 'Bloquear'),
       h('button', { onclick: guard(() => bulk(ids, 'unlock', {}, 'Desbloqueo enviado', load)) }, 'Desbloquear'),
       canAdmin() ? h('button', { onclick: () => assignDialog(ids, load) }, 'Cambiar perfil') : null,
-      canAdmin() ? h('button', { onclick: () => assignClientDialog(ids, load) }, 'Asignar cliente') : null,
+      h('button', { onclick: () => assignClientDialog(ids, load) }, 'Asignar cliente'),
       canAdmin() ? h('button', { onclick: () => confirmDialog('Reiniciar equipos', `Se van a reiniciar ${plural(ids.length, 'equipo', 'equipos')}. Quien esté mirando algo se va a cortar.`, 'Reiniciar', true, () => bulk(ids, 'reboot', {}, 'Reinicio enviado', load)) }, 'Reiniciar') : null,
       h('span', { class: 'spacer' }),
       h('button', { onclick: () => { selected.clear(); paint(); } }, 'Quitar selección')));
@@ -607,7 +608,8 @@ const statusPill = (s) => h('span', { class: `pill ${STATUS[s]?.[1] || ''}` }, S
 
 async function openDevice(id, onChange) {
   const admin = canAdmin();
-  const [d, files, profiles, clients] = await Promise.all([api('GET', `/api/devices/${id}`), admin ? api('GET', '/api/files') : [], admin ? api('GET', '/api/profiles') : [], admin ? api('GET', '/api/clients') : []]);
+  const staff = canAct();
+  const [d, files, profiles, clients] = await Promise.all([api('GET', `/api/devices/${id}`), admin ? api('GET', '/api/files') : [], admin ? api('GET', '/api/profiles') : [], staff ? api('GET', '/api/clients') : []]);
   const s = d.state;
   const refresh = async () => { dlg.close(); await onChange?.(); await openDevice(id, onChange); };
   const name = h('input', { type: 'text', id: 'dn', value: d.name, maxlength: 80 });
@@ -652,8 +654,8 @@ async function openDevice(id, onChange) {
       ['Launcher', s.launcherVersion || ''], ['Red', s.network || ''], ['IP local', s.ip || ''], ['IP pública', d.publicIp], ['MAC', s.mac || ''],
       ['Kiosko', s.kiosk === false ? 'Desactivado' : s.mode === 'compat' ? 'Activo, modo compatible' : (s.lockTask ? 'Activo' : 'Sin confirmar')]].flatMap(([k, v]) => (v ? [h('dt', {}, k), h('dd', {}, v)] : []))),
 
-    h('h3', {}, 'Acciones'),
-    h('div', { class: 'wrap-actions' },
+    staff ? h('h3', {}, 'Acciones') : null,
+    staff ? h('div', { class: 'wrap-actions' },
       h('button', { class: 'primary', onclick: () => sendMessageDialog([id], refresh) }, 'Enviar mensaje'),
       d.blocked ? h('button', { onclick: act('unlock', {}, 'Desbloqueo enviado') }, 'Desbloquear') : h('button', { class: 'danger', onclick: () => lockDialog([id], refresh) }, 'Bloquear'),
       admin ? [
@@ -662,16 +664,16 @@ async function openDevice(id, onChange) {
       s.kiosk === false
         ? h('button', { onclick: act('enterKiosk', {}, 'Activación enviada') }, 'Activar kiosko')
         : h('button', { onclick: () => confirmDialog('Salir del kiosko', `${d.name} va a volver al launcher original y queda sin protección hasta reactivar el kiosko.`, 'Salir del kiosko', true, act('exitKiosk', {}, 'Salida enviada')) }, 'Salir del kiosko'),
-      h('button', { class: 'danger', onclick: () => confirmDialog('Dar de baja', `WiFly deja de administrar ${d.name} y el equipo vuelve a su estado original. Para administrarlo otra vez hay que reinstalarlo con el script.`, 'Dar de baja', true, act('decommission', {}, 'Baja enviada')) }, 'Dar de baja')] : null),
+      h('button', { class: 'danger', onclick: () => confirmDialog('Dar de baja', `WiFly deja de administrar ${d.name} y el equipo vuelve a su estado original. Para administrarlo otra vez hay que reinstalarlo con el script.`, 'Dar de baja', true, act('decommission', {}, 'Baja enviada')) }, 'Dar de baja')] : null) : null,
 
-    admin ? [h('h3', {}, 'Datos'),
+    staff ? [h('h3', {}, 'Datos'),
     h('label', { for: 'dn' }, 'Nombre'), name,
     h('label', { for: 'dg' }, 'Grupo'), group,
     h('label', { for: 'dcl' }, 'Cliente'), client,
-    h('label', { for: 'dp' }, 'Perfil'), profile,
+    admin ? [h('label', { for: 'dp' }, 'Perfil'), profile] : null,
     h('label', { for: 'dnotes' }, 'Notas'), notes,
     h('div', { class: 'save-bar' }, h('button', { class: 'primary', onclick: guard(async () => {
-      await api('PATCH', `/api/devices/${id}`, { name: name.value, group: group.value, profileId: Number(profile.value), notes: notes.value, clientId: client.value ? Number(client.value) : null });
+      await api('PATCH', `/api/devices/${id}`, { name: name.value, group: group.value, ...(admin ? { profileId: Number(profile.value) } : {}), notes: notes.value, clientId: client.value ? Number(client.value) : null });
       toast('Cambios guardados');
       await refresh();
     }) }, 'Guardar cambios'))] : null,
@@ -890,7 +892,7 @@ async function viewLibrary() {
 
 // ---- Envíos ----------------------------------------------------------------------------------------
 async function viewSends() {
-  const [sends, audit] = await Promise.all([api('GET', '/api/sends'), canAdmin() ? api('GET', '/api/audit') : null]);
+  const [sends, audit] = await Promise.all([api('GET', '/api/sends'), canAdmin() || isViewer() ? api('GET', '/api/audit') : null]);
   fill(
     header('Envíos'),
     h('div', { class: 'sheet' }, h('h2', {}, 'Mensajes y órdenes'),
@@ -937,7 +939,7 @@ async function viewEnroll() {
         h('p', {}, 'Con el TV Box conectado por ADB, corré desde la carpeta de instalación:'),
         h('pre', {}, `./enroll.sh --server ${origin} --token ${t.token}`),
         h('p', { class: 'hint' }, 'En Windows: ', h('code', {}, `enroll.bat ${origin} ${t.token}`)),
-        h('button', { class: 'plain', onclick: () => confirmDialog('Revocar token', 'Los equipos ya registrados siguen funcionando. No se van a poder sumar equipos nuevos con este token.', 'Revocar token', true, guard(async () => { await api('DELETE', `/api/enroll-tokens/${t.token}`); go('enroll'); })) }, 'Revocar token'));
+        canAdmin() && h('button', { class: 'plain', onclick: () => confirmDialog('Revocar token', 'Los equipos ya registrados siguen funcionando. No se van a poder sumar equipos nuevos con este token.', 'Revocar token', true, guard(async () => { await api('DELETE', `/api/enroll-tokens/${t.token}`); go('enroll'); })) }, 'Revocar token'));
     }));
 }
 
@@ -948,7 +950,7 @@ async function viewAccount() {
   const nxt = passwordField('c-n', 'Clave nueva');
   fill(
     header('Cuenta'),
-    h('div', { class: 'sheet' }, h('p', {}, 'Entraste como ', h('strong', {}, me.username), `, ${ROLE[me.role]}`, me.company && !isSuper() ? ` de ${me.company.name}` : '', '.'),
+    h('div', { class: 'sheet' }, h('p', {}, 'Entraste como ', h('strong', {}, me.username), `, ${me.roleLabel}`, me.company && !isGlobal() ? ` de ${me.company.name}` : '', '.'),
       h('h2', {}, 'Tus datos'),
       me.email ? null : h('div', { class: 'note' }, 'Cargá tu email: sin él no vas a poder recuperar la clave si te la olvidás.'),
       h('div', { class: 'form-grid' }, data.els),
@@ -979,7 +981,6 @@ else start().catch(() => {});
 window.addEventListener('hashchange', () => { if (location.hash.startsWith('#reset=')) showReset(location.hash.slice(7)); });
 
 // ---- Vistas compartidas -------------------------------------------------------------------------
-const ROLE = { superadmin: 'administrador general', admin: 'administrador', operator: 'operador' };
 
 function auditTable(rows) {
   if (!rows.length) return h('p', { class: 'hint' }, 'Sin actividad todavía.');
@@ -990,7 +991,29 @@ function auditTable(rows) {
 
 // ---- Usuarios --------------------------------------------------------------------------------------
 /** Sin empresa elegida (administrador general): los administradores generales. Con empresa: sus usuarios. */
-function usersSheet(users, roles, title, intro) {
+/**
+ * Tabla de usuarios con alta, edición de datos y rol, cambio de clave y baja.
+ * `roles`: [valor, nombre, explicación]. `companies`: si se pasa, el operador del sistema elige sus empresas.
+ */
+function usersSheet(users, { roles, title, intro = '', canCreate = true, manageable, companies = null }) {
+  const roleHelp = h('p', { class: 'hint span2' });
+  const roleSelect = (id, value, onChange) => {
+    const sel = h('select', { id }, roles.map(([v, t]) => h('option', { value: v, selected: v === value }, t)));
+    const paint = () => { roleHelp.textContent = roles.find(([v]) => v === sel.value)?.[2] || ''; onChange?.(sel.value); };
+    sel.addEventListener('change', paint);
+    return { sel, paint };
+  };
+  /** Casillas de empresas para el operador del sistema. */
+  const companyPicker = (chosen = []) => {
+    if (!companies) return null;
+    const set = new Set(chosen);
+    const box = h('div', { class: 'span2' }, h('label', {}, 'Empresas que administra'),
+      companies.length ? h('div', { class: 'pick-list' }, companies.map((c) => h('label', { class: 'check' },
+        h('input', { type: 'checkbox', checked: set.has(c.id), onchange: (e) => { if (e.target.checked) set.add(c.id); else set.delete(c.id); } }), c.name)))
+        : h('p', { class: 'hint' }, 'Todavía no hay empresas. Las que cree este operador le quedan asignadas solas.'),
+      h('p', { class: 'hint' }, 'Solo ve estas empresas y las que cree él mismo.'));
+    return { box, ids: () => [...set] };
+  };
   const reset = (u) => {
     const pw = passwordField('rp', 'Clave nueva');
     const d = dialog(`Nueva clave para ${u.displayName || u.username}`, h('div', {}, pw.el,
@@ -1002,36 +1025,55 @@ function usersSheet(users, roles, title, intro) {
   };
   const edit = (u) => {
     const data = userFields('eu', u);
-    const d = dialog(`Datos de ${u.username}`, h('div', { class: 'form-grid' }, data.els), [
+    const picker = companyPicker((u.companies || []).map((c) => c.id));
+    const canPickRole = roles.some(([v]) => v === u.role) && roles.length > 1;
+    const role = roleSelect('eu-r', u.role, (v) => { if (picker) picker.box.hidden = v !== 'sysoperator'; });
+    const d = dialog(`Editar ${u.username}`, h('div', { class: 'form-grid' },
+      canPickRole ? [h('div', { class: 'span2' }, h('label', { for: 'eu-r' }, 'Rol'), role.sel), roleHelp] : null,
+      picker?.box,
+      data.els), [
       h('button', { onclick: () => d.close() }, 'Cancelar'),
-      h('button', { class: 'primary', onclick: guard(async () => { await api('PATCH', `/api/users/${u.id}`, data.values()); d.close(); toast('Datos guardados'); go(current); }) }, 'Guardar datos'),
+      h('button', { class: 'primary', onclick: guard(async () => {
+        const body = { ...data.values() };
+        if (canPickRole) body.role = role.sel.value;
+        if (picker && role.sel.value === 'sysoperator') body.companyIds = picker.ids();
+        await api('PATCH', `/api/users/${u.id}`, body);
+        d.close();
+        toast('Usuario guardado');
+        go(current);
+      }) }, 'Guardar'),
     ], 'xwide');
+    if (canPickRole) role.paint(); else if (picker) picker.box.hidden = u.role !== 'sysoperator';
     data.focus();
   };
   const create = () => {
     const user = field('nu-u', 'Nombre de usuario', { maxlength: 40, autocomplete: 'off' }, { hint: 'Con este entra al panel. Letras, números, punto, guion o @.' });
-    const role = h('select', { id: 'nu-r' }, roles.map(([v, t]) => h('option', { value: v }, t)));
+    const picker = companyPicker();
+    const role = roleSelect('nu-r', roles[0][0], (v) => { if (picker) picker.box.hidden = v !== 'sysoperator'; });
     const pw = passwordField('nu-p', 'Clave');
     const data = userFields('nu');
     const d = dialog('Crear usuario', h('div', { class: 'form-grid' },
       user.el,
-      roles.length > 1 ? h('div', {}, h('label', { for: 'nu-r' }, 'Rol'), role) : h('div'),
+      h('div', {}, h('label', { for: 'nu-r' }, 'Rol'), role.sel),
+      roleHelp,
+      picker?.box,
       h('div', { class: 'span2' }, pw.el),
-      ...data.els,
-      roles.some(([v]) => v === 'operator') ? h('p', { class: 'hint span2' }, 'El operador solo puede enviar mensajes, bloquear y desbloquear equipos.') : null), [
+      ...data.els), [
       h('button', { onclick: () => d.close() }, 'Cancelar'),
       h('button', { class: 'primary', onclick: guard(async () => {
-        await api('POST', '/api/users', { username: user.input.value, password: pw.input.value, role: role.value, ...data.values() });
+        const body = { username: user.input.value, password: pw.input.value, role: role.sel.value, ...data.values() };
+        if (picker && role.sel.value === 'sysoperator') body.companyIds = picker.ids();
+        await api('POST', '/api/users', body);
         d.close();
         toast(`Usuario ${user.input.value} creado`);
         go(current);
       }) }, 'Crear usuario'),
     ], 'xwide');
+    role.paint();
     user.input.focus();
   };
-  const manageable = (u) => u.username !== me.username && (isSuper() || u.role === 'operator');
   return h('div', { class: 'sheet' },
-    h('div', { class: 'sheet-head' }, h('h2', {}, title), h('button', { class: 'primary', onclick: create }, 'Crear usuario')),
+    h('div', { class: 'sheet-head' }, h('h2', {}, title), canCreate ? h('button', { class: 'primary', onclick: create }, 'Crear usuario') : null),
     intro ? h('p', {}, intro) : null,
     h('div', { class: 'table-wrap' }, h('table', {},
       h('thead', {}, h('tr', {}, ['Usuario', 'Nombre', 'Contacto', 'Rol', ''].map((t) => h('th', {}, t)))),
@@ -1039,18 +1081,44 @@ function usersSheet(users, roles, title, intro) {
         h('td', {}, h('strong', {}, u.username), u.username === me.username ? ' (vos)' : ''),
         h('td', {}, u.fullName || h('span', { class: 'hint' }, 'Sin cargar'), u.displayName && u.displayName !== u.fullName ? [h('br'), h('small', {}, `Se muestra como ${u.displayName}`)] : null),
         h('td', {}, u.email || h('span', { class: 'hint' }, 'Sin email'), u.phone ? [h('br'), h('small', {}, u.phone)] : null),
-        h('td', {}, u.roleLabel),
-        h('td', {}, manageable(u) ? h('div', { class: 'row-actions' },
-          h('button', { onclick: () => edit(u) }, 'Editar datos'),
+        h('td', {}, u.roleLabel.charAt(0).toUpperCase() + u.roleLabel.slice(1),
+          u.companies ? [h('br'), h('small', {}, u.companies.length ? u.companies.map((c) => c.name).join(', ') : 'Sin empresas asignadas')] : null),
+        h('td', {}, u.username !== me.username && manageable(u) ? h('div', { class: 'row-actions' },
+          h('button', { onclick: () => edit(u) }, 'Editar'),
           h('button', { onclick: () => reset(u) }, 'Cambiar clave'),
           h('button', { class: 'danger', onclick: () => confirmDialog('Eliminar usuario', `${u.username} ya no va a poder entrar al panel.`, 'Eliminar usuario', true, guard(async () => { await api('DELETE', `/api/users/${u.id}`); go(current); })) }, 'Eliminar')) : null)))))));
 }
 
+const COMPANY_ROLES = [
+  ['admin', 'Administrador de la empresa', 'Maneja todo en la empresa: equipos, clientes, perfiles, apps, altas, usuarios y respaldos.'],
+  ['operator', 'Operador de la empresa', 'Agrega clientes y equipos, y les envía mensajes, los bloquea y desbloquea. No borra nada ni toca perfiles ni apps.'],
+];
+
 async function viewUsers() {
   const users = await api('GET', '/api/users');
-  const roles = isSuper() ? [['admin', 'Administrador de la empresa'], ['operator', 'Operador']] : [['operator', 'Operador']];
-  fill(header('Usuarios'), usersSheet(users, roles, `Usuarios de ${me.company.name}`, isSuper() ? '' : 'Podés crear operadores. Para sumar otro administrador, pedíselo a tu proveedor.'));
+  const admin = canAdmin();
+  fill(header('Usuarios'), usersSheet(users, {
+    roles: COMPANY_ROLES, title: `Usuarios de ${me.company.name}`, canCreate: admin,
+    intro: admin ? '' : 'Solo lectura.', manageable: () => admin,
+  }));
 }
+
+const SYSTEM_ROLES = [
+  ['sysadmin', 'Administrador del sistema', 'Puede modificar todo en el sistema: empresas, facturación, configuración, respaldos, actualizaciones y usuarios.'],
+  ['sysoperator', 'Operador del sistema', 'Agrega empresas pero no las borra. Solo ve y administra las empresas que tiene asignadas y las que crea.'],
+  ['billing', 'Facturación', 'Ve todo sin modificar nada. Puede suspender y reactivar empresas por falta de pago, y exportar la facturación a Excel.'],
+];
+
+async function viewSystemUsers() {
+  const [users, companies] = await Promise.all([api('GET', '/api/users?scope=system'), api('GET', '/api/companies')]);
+  const roles = isSuper() ? SYSTEM_ROLES : SYSTEM_ROLES.filter(([v]) => v !== 'sysadmin');
+  fill(header('Usuarios del sistema'), usersSheet(users, {
+    roles, title: 'Usuarios del sistema', companies: companies.map((c) => ({ id: c.id, name: c.name })),
+    intro: `El rol de administrador general es único y lo tiene ${users.find((u) => u.role === 'superadmin')?.username || 'el usuario principal'}.${isSuper() ? '' : ' Los administradores del sistema los crea el administrador general.'} Los usuarios de cada empresa se crean adentro de la empresa, en su sección Usuarios.`,
+    manageable: (u) => (u.role === 'superadmin' || u.role === 'sysadmin' ? isSuper() : true),
+  }));
+}
+
 
 // ---- Clientes ---------------------------------------------------------------------------------------
 let clientSearch = '';
@@ -1065,7 +1133,7 @@ async function viewClients() {
     if (!clients.length) {
       box.replaceChildren(h('div', { class: 'empty' }, h('h2', {}, 'Todavía no hay clientes'),
         h('p', {}, 'Cargá a quienes les instalás los TV Box. Después asignales sus equipos para encontrarlos, avisarles o bloquearlos juntos.'),
-        canAdmin() ? h('button', { class: 'primary', onclick: () => clientDialog(null) }, 'Crear cliente') : null));
+        canAct() ? h('button', { class: 'primary', onclick: () => clientDialog(null) }, 'Crear cliente') : null));
       return;
     }
     box.replaceChildren(list.length ? h('div', { class: 'sheet' }, h('div', { class: 'table-wrap' }, h('table', { class: 'clients' },
@@ -1079,7 +1147,7 @@ async function viewClients() {
   };
   fill(
     header('Clientes', h('span', { class: 'count' }, clients.length ? `${plural(clients.length, 'cliente', 'clientes')}, ${plural(total, 'equipo asignado', 'equipos asignados')}` : ''),
-      h('span', { class: 'spacer' }), canAdmin() && clients.length ? h('button', { class: 'primary', onclick: () => clientDialog(null) }, 'Crear cliente') : null),
+      h('span', { class: 'spacer' }), canAct() && clients.length ? h('button', { class: 'primary', onclick: () => clientDialog(null) }, 'Crear cliente') : null),
     clients.length ? h('div', { class: 'filters' }, h('input', { type: 'search', placeholder: 'Buscar por ID, nombre, teléfono o documento', 'aria-label': 'Buscar cliente', value: clientSearch, oninput: (e) => { clientSearch = e.target.value; paint(); } })) : null,
     box);
   paint();
@@ -1111,22 +1179,23 @@ function clientDialog(c, after) {
 async function openClient(id) {
   const c = await api('GET', `/api/clients/${id}`);
   const admin = canAdmin();
+  const staff = canAct();
   const chosen = new Set();
   const reopen = async () => { dlg.close(); if (current === 'clients') await viewClients(); await openClient(id); };
   const ids = () => (chosen.size ? [...chosen] : c.deviceList.map((d) => d.id));
   const target = () => (chosen.size ? plural(chosen.size, 'equipo elegido', 'equipos elegidos') : 'todos sus equipos');
   const actions = h('div', { class: 'wrap-actions' });
-  const paintActions = () => actions.replaceChildren(...[
+  const paintActions = () => actions.replaceChildren(...(!staff ? [] : [
     h('button', { class: 'primary', disabled: !c.deviceList.length, onclick: () => sendMessageDialog(ids(), reopen) }, 'Enviar mensaje'),
     h('button', { class: 'danger', disabled: !c.deviceList.length, onclick: () => lockDialog(ids(), reopen) }, 'Bloquear'),
     h('button', { disabled: !c.deviceList.length, onclick: guard(() => bulk(ids(), 'unlock', {}, 'Desbloqueo enviado', reopen)) }, 'Desbloquear'),
-    admin ? h('button', { onclick: () => addDevicesDialog(c, reopen) }, 'Agregar equipos') : null,
-    admin && chosen.size ? h('button', { onclick: guard(() => bulk([...chosen], 'assignClient', { clientId: null }, 'Equipos quitados del cliente', reopen)) }, 'Quitar del cliente') : null,
+    h('button', { onclick: () => addDevicesDialog(c, reopen) }, 'Agregar equipos'),
+    chosen.size ? h('button', { onclick: guard(() => bulk([...chosen], 'assignClient', { clientId: null }, 'Equipos quitados del cliente', reopen)) }, 'Quitar del cliente') : null,
     h('p', { class: 'hint' }, `Las acciones se aplican a ${target()}.`),
-  ].filter(Boolean));
+  ].filter(Boolean)));
   paintActions();
   const rows = c.deviceList.map((d) => h('tr', {},
-    h('td', {}, h('input', { type: 'checkbox', 'aria-label': `Elegir ${d.name}`, onchange: (e) => { if (e.target.checked) chosen.add(d.id); else chosen.delete(d.id); paintActions(); } })),
+    h('td', {}, staff && h('input', { type: 'checkbox', 'aria-label': `Elegir ${d.name}`, onchange: (e) => { if (e.target.checked) chosen.add(d.id); else chosen.delete(d.id); paintActions(); } })),
     h('td', {}, h('strong', {}, d.name), h('br'), h('small', {}, d.state.model || '')),
     h('td', {}, d.suspended ? [h('span', { class: 'dot bad' }), 'Suspendido'] : d.blocked ? [h('span', { class: 'dot bad' }), 'Bloqueado'] : d.online ? [h('span', { class: 'dot on' }), 'En línea'] : [h('span', { class: 'dot' }), `Visto ${ago(d.lastSeen)}`]),
     h('td', {}, h('button', { class: 'plain', onclick: () => openDevice(d.id, reopen) }, 'Ver'))));
@@ -1134,11 +1203,11 @@ async function openClient(id) {
   const dlg = h('dialog', { class: 'drawer' },
     h('div', { class: 'drawer-head' }, h('h2', {}, c.name), h('button', { onclick: () => dlg.close() }, 'Cerrar')),
     h('dl', { class: 'facts' }, facts.flatMap(([k, v]) => (v ? [h('dt', {}, k), h('dd', {}, v)] : []))),
-    admin ? h('div', { class: 'wrap-actions' },
+    staff ? h('div', { class: 'wrap-actions' },
       h('button', { onclick: () => clientDialog(c, async () => reopen()) }, 'Editar datos'),
-      h('button', { class: 'danger', onclick: () => confirmDialog(`Eliminar ${c.name}`, `Se borra el cliente. ${c.devices ? `Sus ${plural(c.devices, 'equipo', 'equipos')} siguen funcionando, sin cliente asignado.` : ''}`, 'Eliminar cliente', true, guard(async () => { await api('DELETE', `/api/clients/${c.id}`); dlg.close(); go('clients'); })) }, 'Eliminar cliente')) : null,
+      admin && h('button', { class: 'danger', onclick: () => confirmDialog(`Eliminar ${c.name}`, `Se borra el cliente. ${c.devices ? `Sus ${plural(c.devices, 'equipo', 'equipos')} siguen funcionando, sin cliente asignado.` : ''}`, 'Eliminar cliente', true, guard(async () => { await api('DELETE', `/api/clients/${c.id}`); dlg.close(); go('clients'); })) }, 'Eliminar cliente')) : null,
     h('h3', {}, `Equipos (${c.deviceList.length})`, c.online ? `, ${c.online} en línea` : ''),
-    c.deviceList.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'devices' }, h('tbody', {}, rows))) : h('p', { class: 'hint' }, admin ? 'Este cliente no tiene equipos. Agregalos acá, desde Pantallas o al crear un token de alta.' : 'Este cliente no tiene equipos asignados.'),
+    c.deviceList.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'devices' }, h('tbody', {}, rows))) : h('p', { class: 'hint' }, staff ? 'Este cliente no tiene equipos. Agregalos acá, desde Pantallas o al crear un token de alta.' : 'Este cliente no tiene equipos asignados.'),
     actions);
   dlg.addEventListener('close', () => dlg.remove());
   document.body.append(dlg);
@@ -1181,7 +1250,8 @@ function companyState(c) {
 }
 
 async function viewCompanies() {
-  const [companies, settings] = await Promise.all([api('GET', '/api/companies'), api('GET', '/api/settings')]);
+  const companies = await api('GET', '/api/companies');
+  const settings = { graceDays: me.graceDays };
   const total = companies.reduce((n, c) => n + c.monthDevices, 0);
   const rows = companies.map((c) => h('tr', {},
     h('td', {}, h('strong', {}, c.name),
@@ -1191,21 +1261,22 @@ async function viewCompanies() {
     h('td', { class: 'num' }, c.devices), h('td', { class: 'num' }, c.online), h('td', { class: 'num' }, c.monthDevices),
     h('td', {}, c.admins.join(', ') || h('span', { class: 'hint' }, 'Sin administrador')),
     h('td', {}, h('div', { class: 'row-actions' },
-      h('button', { class: 'primary', onclick: guard(() => setContext(c.id)) }, 'Administrar'),
-      c.status === 'active'
+      h('button', { class: 'primary', onclick: guard(() => setContext(c.id)) }, perm('companiesEdit') || perm('companiesDelete') ? 'Administrar' : 'Ver'),
+      !perm('companiesSuspend') ? null : c.status === 'active'
         ? h('button', { class: 'danger', onclick: () => confirmDialog(`Suspender ${c.name}`, `El panel de ${c.name} se corta ahora. Si no se registra el pago en ${settings.graceDays} días, sus TV Box muestran "Servicio suspendido".`, 'Suspender', true, guard(async () => { await api('POST', `/api/companies/${c.id}/suspend`, {}); toast(`${c.name} suspendida`); go('companies'); })) }, 'Suspender')
         : h('button', { onclick: guard(async () => { await api('POST', `/api/companies/${c.id}/activate`, {}); toast(`Pago registrado: ${c.name} reactivada`); go('companies'); }) }, 'Marcar pagada'),
-      h('button', { onclick: () => editCompany(c) }, 'Editar'),
-      c.devices === 0 ? h('button', { class: 'plain', onclick: () => confirmDialog(`Eliminar ${c.name}`, 'Se borran la empresa, sus usuarios, perfiles y archivos. No se puede deshacer.', 'Eliminar empresa', true, guard(async () => { await api('DELETE', `/api/companies/${c.id}`); go('companies'); })) }, 'Eliminar') : null))));
+      perm('companiesEdit') ? h('button', { onclick: () => editCompany(c) }, 'Editar') : null,
+      c.devices === 0 && perm('companiesDelete') ? h('button', { class: 'plain', onclick: () => confirmDialog(`Eliminar ${c.name}`, 'Se borran la empresa, sus usuarios, perfiles y archivos. No se puede deshacer.', 'Eliminar empresa', true, guard(async () => { await api('DELETE', `/api/companies/${c.id}`); go('companies'); })) }, 'Eliminar') : null))));
   fill(
     header('Empresas', h('span', { class: 'count' }, companies.length ? `${plural(companies.length, 'empresa', 'empresas')}, ${plural(total, 'equipo facturable', 'equipos facturables')} este mes` : ''),
-      h('span', { class: 'spacer' }), h('button', { class: 'primary', onclick: newCompany }, 'Crear empresa')),
+      h('span', { class: 'spacer' }), perm('companiesCreate') ? h('button', { class: 'primary', onclick: newCompany }, 'Crear empresa') : null),
     companies.length
       ? h('div', { class: 'sheet' }, h('div', { class: 'table-wrap' }, h('table', { class: 'companies' },
         h('thead', {}, h('tr', {}, ['Empresa', 'Estado', 'Equipos', 'En línea', 'Facturables este mes', 'Administradores', ''].map((t, i) => h('th', { class: i >= 2 && i <= 4 ? 'num' : null }, t)))),
         h('tbody', {}, rows))))
-      : h('div', { class: 'empty' }, h('h2', {}, 'Todavía no hay empresas'), h('p', {}, 'Creá la primera empresa con su administrador. Él va a poder cargar sus equipos, perfiles y apps.'),
-        h('button', { class: 'primary', onclick: newCompany }, 'Crear empresa')));
+      : h('div', { class: 'empty' }, h('h2', {}, perm('companiesAll') ? 'Todavía no hay empresas' : 'No tenés empresas asignadas'),
+        h('p', {}, perm('companiesCreate') ? 'Creá una empresa con su administrador. Él va a poder cargar sus equipos, perfiles y apps.' : 'Pedile al administrador que te asigne las empresas que vas a manejar.'),
+        perm('companiesCreate') ? h('button', { class: 'primary', onclick: newCompany }, 'Crear empresa') : null));
 }
 
 function newCompany() {
@@ -1277,7 +1348,7 @@ async function viewBilling() {
 
 // ---- Configuración general ------------------------------------------------------------------------
 async function viewSettings() {
-  const [settings, users, audit] = await Promise.all([api('GET', '/api/settings'), api('GET', '/api/users'), api('GET', '/api/audit')]);
+  const [settings, audit] = await Promise.all([api('GET', '/api/settings'), api('GET', '/api/audit')]);
   const gid = h('input', { type: 'text', id: 's-gid', value: settings.googleClientId, placeholder: '123456-abc.apps.googleusercontent.com', autocomplete: 'off' });
   const gsecret = h('input', { type: 'password', id: 's-gsec', autocomplete: 'new-password', placeholder: settings.googleSecretSet ? 'Guardado. Dejalo vacío para no cambiarlo' : '' });
   const phrase = h('input', { type: 'text', id: 's-ph', maxlength: 40, value: settings.brandPhrase, placeholder: 'por DBI', oninput: () => paint() });
@@ -1312,7 +1383,6 @@ async function viewSettings() {
         toast('Aplicación de Google guardada');
       }) }, 'Guardar aplicación de Google'))),
     mailSheet(settings),
-    usersSheet(users, [['superadmin', 'Administrador general']], 'Administradores generales', 'Pueden ver y administrar todas las empresas.'),
     h('div', { class: 'sheet' }, h('h2', {}, 'Actividad general'), auditTable(audit)));
 }
 
@@ -1543,7 +1613,7 @@ async function viewBackups(scope) {
         h('button', { onclick: () => destDialog(d) }, 'Editar'),
         h('button', { class: 'plain', onclick: () => confirmDialog('Quitar destino', `Se deja de respaldar en ${d.name}. Los respaldos que ya están ahí no se borran.`, 'Quitar destino', true, () => saveAll({ destinations: s.destinations.filter((x) => x.id !== d.id).map((x) => ({ id: x.id, type: x.type, name: x.name, config: { ...x.config } })) })) }, 'Quitar')))));
     return h('div', { class: 'sheet' }, h('div', { class: 'sheet-head' }, h('h2', {}, 'Destinos'), h('button', { onclick: () => destDialog(null) }, 'Agregar destino')),
-      !s.googleReady && s.destinations.some((d) => d.type === 'gdrive') ? h('div', { class: 'note' }, isSuper() ? 'Falta cargar la aplicación de Google en Configuración para conectar Google Drive.' : 'El administrador general todavía no configuró la aplicación de Google. Pedíselo para poder conectar Google Drive.') : null,
+      !s.googleReady && s.destinations.some((d) => d.type === 'gdrive') ? h('div', { class: 'note' }, perm('settings') ? 'Falta cargar la aplicación de Google en Configuración para conectar Google Drive.' : 'El administrador general todavía no configuró la aplicación de Google. Pedíselo para poder conectar Google Drive.') : null,
       rows.length ? h('div', { class: 'table-wrap' }, h('table', {}, h('tbody', {}, rows))) : h('p', { class: 'hint' }, 'Agregá dónde guardar los respaldos: un servidor SFTP, uno FTPS o Google Drive. Conviene tener dos, en lugares distintos.'));
   }
 

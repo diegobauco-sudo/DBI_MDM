@@ -123,10 +123,13 @@ test('clientes: alta con ID manual, validaciones y orden por ID', async () => {
   const list = (await adm.call('GET', '/api/clients')).body;
   assert.deepEqual(list.map((c) => c.extId), ['2', '10', 'A-7'], 'orden natural: 2 antes que 10');
   assert.equal(list[0].taxId, '20-12345678-6');
-  // El operador ve los clientes pero no los modifica.
+  // El operador agrega y edita clientes, pero no los borra.
   assert.equal((await op.call('GET', '/api/clients')).status, 200);
-  assert.equal((await op.call('POST', '/api/clients', { extId: '50', name: 'X' })).status, 403);
-  assert.equal((await op.call('PUT', `/api/clients/${list[0].id}`, { extId: '2', name: 'X' })).status, 403);
+  const nuevo = await op.call('POST', '/api/clients', { extId: '50', name: 'Cargado por el operador' });
+  assert.equal(nuevo.status, 200);
+  assert.equal((await op.call('PUT', `/api/clients/${nuevo.body.id}`, { extId: '50', name: 'Corregido' })).status, 200);
+  assert.equal((await op.call('DELETE', `/api/clients/${nuevo.body.id}`)).status, 403);
+  assert.equal((await adm.call('DELETE', `/api/clients/${nuevo.body.id}`)).status, 200);
 });
 
 test('los equipos se asignan a un cliente: por token, desde el equipo o en grupo', async () => {
@@ -144,9 +147,12 @@ test('los equipos se asignan a un cliente: por token, desde el equipo o en grupo
 
   assert.equal((await adm.call('PATCH', `/api/devices/${devs[2]}`, { clientId: carla.id })).status, 200);
   assert.equal((await adm.call('GET', `/api/devices/${devs[2]}`)).body.clientExtId, '10');
-  // Asignación en grupo, y el operador no puede cambiar clientes.
-  assert.equal((await op.call('POST', '/api/devices/bulk', { ids: [devs[0]], action: 'assignClient', payload: { clientId: carla.id } })).status, 403);
-  assert.equal((await adm.call('POST', '/api/devices/bulk', { ids: [devs[0]], action: 'assignClient', payload: { clientId: carla.id } })).status, 200);
+  // El operador asigna clientes y edita el nombre, pero no cambia el perfil ni borra equipos.
+  assert.equal((await op.call('POST', '/api/devices/bulk', { ids: [devs[0]], action: 'assignClient', payload: { clientId: carla.id } })).status, 200);
+  assert.equal((await op.call('PATCH', `/api/devices/${devs[0]}`, { name: 'Living' })).status, 200);
+  assert.equal((await op.call('PATCH', `/api/devices/${devs[0]}`, { profileId: null })).status, 403);
+  assert.equal((await op.call('DELETE', `/api/devices/${devs[0]}`)).status, 403);
+  assert.equal((await op.call('POST', '/api/enroll-tokens', { label: 'Del operador' })).status, 200, 'el operador da de alta equipos');
   const list = (await adm.call('GET', '/api/clients')).body;
   assert.equal(list.find((c) => c.extId === '2').devices, 1);
   assert.equal(list.find((c) => c.extId === '10').devices, 2);

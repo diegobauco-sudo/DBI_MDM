@@ -126,9 +126,11 @@ test('el mismo archivo subido por dos empresas queda separado', async () => {
   assert.ok(!fs.existsSync(blob), 'nadie lo usa: se borra del disco');
 });
 
-test('el operador solo envía mensajes, bloquea y desbloquea', async () => {
+test('el operador de la empresa manda mensajes, bloquea y desbloquea, sin borrar ni tocar perfiles', async () => {
   assert.equal((await adminA.call('POST', '/api/users', { ...usuario('op.sur', 'Clave-op-123'), role: 'operator' })).status, 200);
-  assert.equal((await adminA.call('POST', '/api/users', { ...usuario('otro.admin', 'Clave-ad-123'), role: 'admin' })).status, 403, 'un administrador no crea administradores');
+  const otro = await adminA.call('POST', '/api/users', { ...usuario('otro.admin', 'Clave-ad-123'), role: 'admin' });
+  assert.equal(otro.status, 200, 'el administrador de la empresa crea otros administradores');
+  assert.equal((await adminA.call('DELETE', `/api/users/${otro.body.id}`)).status, 200);
   assert.equal((await adminA.call('POST', '/api/users', { ...usuario('nuevo.super', 'Clave-su-123'), role: 'superadmin' })).status, 403);
   assert.equal((await opA.login('op.sur', 'Clave-op-123')).status, 200);
   assert.equal((await opA.call('GET', '/api/devices')).status, 200);
@@ -139,7 +141,7 @@ test('el operador solo envía mensajes, bloquea y desbloquea', async () => {
   for (const action of ['reboot', 'uninstall', 'assignProfile', 'decommission']) {
     assert.equal((await opA.call('POST', '/api/devices/bulk', { ids: [devA.deviceId], action, payload: {} })).status, 403, action);
   }
-  for (const [m, u] of [['GET', '/api/profiles'], ['GET', '/api/files'], ['PATCH', `/api/devices/${devA.deviceId}`], ['DELETE', `/api/devices/${devA.deviceId}`], ['GET', '/api/enroll-tokens'], ['GET', '/api/users'], ['GET', '/api/audit']]) {
+  for (const [m, u] of [['PUT', '/api/profiles/1'], ['POST', '/api/profiles'], ['DELETE', `/api/devices/${devA.deviceId}`], ['GET', '/api/known-apps'], ['GET', '/api/users'], ['GET', '/api/audit']]) {
     assert.equal((await opA.call(m, u, m === 'GET' ? undefined : {})).status, 403, `${m} ${u}`);
   }
   const users = (await adminA.call('GET', '/api/users')).body;
@@ -153,7 +155,8 @@ test('el administrador general administra una empresa eligiéndola', async () =>
   assert.equal((await sup.call('GET', '/api/devices')).body.length, 3);
   assert.equal((await sup.call('POST', '/api/users', { ...usuario('admin2.bar', 'Clave-ad2-123'), role: 'admin' })).status, 200);
   await sup.call('POST', '/api/context', { companyId: null });
-  assert.deepEqual((await sup.call('GET', '/api/users')).body.map((u) => u.username), ['admin'], 'sin empresa: los administradores generales');
+  assert.deepEqual((await sup.call('GET', '/api/users?scope=system')).body.map((u) => u.username), ['admin'], 'los usuarios del sistema');
+  assert.equal((await sup.call('GET', '/api/users')).status, 409, 'sin empresa elegida no hay usuarios de empresa');
 });
 
 test('la marca: nombre de la empresa y frase fija llegan al TV Box', async () => {

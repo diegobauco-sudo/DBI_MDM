@@ -24,6 +24,7 @@ export function openDb(dataDir) {
   if (db.prepare('PRAGMA user_version').get().user_version < 3) db.exec('PRAGMA user_version = 3');
   // Esquema 4: datos fiscales de la empresa, datos de contacto de los usuarios, clientes y recuperación de clave.
   migrateV4(db);
+  migrateV5(db);
   db.exec('PRAGMA foreign_keys = ON;');
   return db;
 }
@@ -72,6 +73,51 @@ function migrateV4(db) {
   }
 }
 
+/** Roles del sistema (sin empresa) y de empresa. */
+export const ROLES = ['superadmin', 'sysadmin', 'sysoperator', 'billing', 'admin', 'operator'];
+const ROLE_LIST = ROLES.map((r) => `'${r}'`).join(',');
+
+/**
+ * Esquema 5: roles nuevos del sistema (administrador, operador y facturación) y empresas asignadas a cada operador.
+ * SQLite no permite cambiar un CHECK: la tabla de usuarios se reconstruye con los mismos datos.
+ */
+function migrateV5(db) {
+  const usersSql = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='users'`).get().sql;
+  db.exec('PRAGMA foreign_keys = OFF');
+  db.exec('BEGIN');
+  try {
+    if (!usersSql.includes("'sysoperator'")) {
+      const cols = 'id, username, salt, hash, role, company_id, created_at, full_name, display_name, phone, email';
+      db.exec(`
+        CREATE TABLE users_v5 (
+          id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL,
+          role TEXT NOT NULL CHECK (role IN (${ROLE_LIST})),
+          company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
+          created_at INTEGER NOT NULL,
+          full_name TEXT NOT NULL DEFAULT '', display_name TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT ''
+        );
+        INSERT INTO users_v5 (${cols}) SELECT ${cols} FROM users;
+        DROP TABLE users;
+        ALTER TABLE users_v5 RENAME TO users;
+      `);
+    }
+    db.exec(`CREATE TABLE IF NOT EXISTS user_companies (
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      PRIMARY KEY (user_id, company_id)
+    )`);
+    const bad = db.prepare('PRAGMA foreign_key_check').all();
+    if (bad.length) throw new Error(`La migración de usuarios dejó referencias inválidas: ${JSON.stringify(bad.slice(0, 3))}`);
+    if (db.prepare('PRAGMA user_version').get().user_version < 5) db.exec('PRAGMA user_version = 5');
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+}
+
 const V2_TABLES = `
   CREATE TABLE IF NOT EXISTS companies (
     id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, status TEXT NOT NULL DEFAULT 'active',
@@ -79,7 +125,7 @@ const V2_TABLES = `
   );
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, hash TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('superadmin','admin','operator')),
+    role TEXT NOT NULL CHECK (role IN (${ROLE_LIST})),
     company_id INTEGER REFERENCES companies(id) ON DELETE CASCADE,
     created_at INTEGER NOT NULL
   );

@@ -93,11 +93,23 @@ Sin `--device`, usa el equipo conectado por USB. Para el primer equipo agregá `
 
 Desde la versión 2.0, un mismo servidor administra varias empresas por separado.
 
+**Roles del sistema** (sección **Usuarios** del panel general, desde 2.4):
+
 | Rol | Qué puede hacer |
 |---|---|
-| **Administrador general** | Crea, edita, suspende y elimina empresas; ve la facturación; define la frase de marca y los días de gracia; administra cualquier empresa eligiéndola con **Administrar**. |
-| **Administrador de empresa** | Todo lo de su empresa: equipos, perfiles, biblioteca de apps, tokens de alta y operadores. No ve nada de otras empresas. |
-| **Operador** | Solo envía mensajes, bloquea y desbloquea equipos de su empresa. |
+| **Administrador general** | Es único: el usuario principal. Todo, incluso crear administradores del sistema. Sus datos y su clave se cambian solo desde su **Cuenta**. |
+| **Administrador del sistema** | Modifica todo: empresas, facturación, configuración, respaldos, actualizaciones y usuarios del sistema, salvo crear otros administradores o tocar al administrador general. |
+| **Operador del sistema** | Crea y edita empresas, pero no las borra ni las suspende. Solo ve las empresas que tiene asignadas (se eligen al crearlo o editarlo) y las que crea él, y adentro las administra completas. |
+| **Facturación** | Ve todas las empresas, la facturación y la actividad, sin modificar nada. Puede suspender y reactivar empresas por falta de pago y exportar la facturación a Excel. Adentro de una empresa ve todo en solo lectura. |
+
+**Roles de cada empresa** (sección **Usuarios** dentro de la empresa; su administrador crea los dos):
+
+| Rol | Qué puede hacer |
+|---|---|
+| **Administrador de la empresa** | Todo lo de su empresa: equipos, clientes, perfiles, biblioteca de apps, altas, usuarios y respaldos. No ve nada de otras empresas. |
+| **Operador de la empresa** | Agrega y edita clientes, da de alta equipos, les asigna cliente, les cambia nombre, grupo y notas, y les envía mensajes, los bloquea y desbloquea. No borra clientes ni equipos, ni toca perfiles, apps o usuarios. |
+
+El rol de un usuario se cambia con **Editar**, dentro del mismo ámbito: un usuario del sistema no pasa a ser de una empresa ni al revés.
 
 - **Facturación:** se factura todo equipo registrado al menos un día del mes, aunque después se dé de baja. El primer día de cada mes, el anterior se cierra y su número ya no cambia. Se exporta a CSV para Excel, con detalle por equipo.
 - **Suspensión:** al suspender una empresa, su panel se corta en el momento. Si en los días de gracia no se marca como pagada, sus TV Box muestran "Servicio suspendido, comuníquese con su proveedor". Al marcarla pagada vuelve todo.
@@ -109,7 +121,7 @@ Desde la versión 2.0, un mismo servidor administra varias empresas por separado
 
 Cada empresa carga sus clientes en **Clientes**: un ID que pone a mano (el mismo de su sistema de gestión, para vincularlos por API más adelante), nombre completo, DNI/CUIT/CUIL, domicilio, teléfono y email. La lista se ordena por ID (2 va antes que 10) y muestra el teléfono y cuántos equipos tiene cada uno.
 
-Los equipos se asignan a un cliente de tres formas: al crear un token de alta con cliente (los equipos nuevos quedan asignados solos), desde el detalle del equipo, o eligiendo varios en **Pantallas** y tocando **Asignar cliente**. Desde la ficha del cliente se le pueden enviar mensajes, bloquear o desbloquear todos sus equipos juntos. El operador ve los clientes y puede hacer esas tres acciones, pero no los modifica. Borrar un cliente no toca sus equipos: quedan sin cliente.
+Los equipos se asignan a un cliente de tres formas: al crear un token de alta con cliente (los equipos nuevos quedan asignados solos), desde el detalle del equipo, o eligiendo varios en **Pantallas** y tocando **Asignar cliente**. Desde la ficha del cliente se le pueden enviar mensajes, bloquear o desbloquear todos sus equipos juntos. El operador de la empresa también agrega y edita clientes y les asigna equipos, pero no los borra. Borrar un cliente no toca sus equipos: quedan sin cliente.
 
 En **Pantallas**, el botón **Pantallas / Lista** cambia entre las pantallas de siempre y una lista con equipo, cliente, estado, red y perfil. El panel recuerda la elección en cada navegador.
 
